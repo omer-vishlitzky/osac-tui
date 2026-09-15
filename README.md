@@ -29,6 +29,20 @@ go run ./cmd/osac-tui \
 Use `--ca-file` when the service certificate is signed by a private CA.
 For development-only connections, `--insecure` skips TLS certificate verification.
 
+### OpenShift cluster
+
+The launcher below discovers the `fulfillment-api` route and cluster CA from
+Kubernetes, then obtains a short-lived token from the existing `osac-admin`
+Keycloak client. It requires `kubectl`, `curl`, and `jq`.
+
+```sh
+KUBECONFIG=/home/ovishlit/.kube/elkana.kubeconfig bash ./run-cluster.sh
+```
+
+Set `OSAC_CLIENT_ID` to use another client present in the
+`keycloak-client-secrets` secret. The token is held in memory and the temporary
+CA file is removed when the TUI exits.
+
 ### Kind dev cluster
 
 The dev cluster already has an accepted `TLSRoute` for

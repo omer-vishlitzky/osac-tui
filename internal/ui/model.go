@@ -84,6 +84,7 @@ type Model struct {
 	height       int
 	status       string
 	err          error
+	errorDialog  bool
 }
 
 func New(api *client.Client, tuiVersion, osacVersion string) Model {
@@ -207,7 +208,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 		m.height = message.Height
-		m.viewport.Width = message.Width - 6
+		m.viewport.Width = maxInt(message.Width-6, 1)
 		m.viewport.Height = m.bodyHeight()
 		m.commandInput.Width = maxInt(message.Width-8, 1)
 		return m, nil
@@ -217,18 +218,21 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.selected = clamp(m.selected, len(m.rows))
 		m.err = message.err
 		if message.err != nil {
-			m.status = "List failed"
+			m.status = "Unavailable on this server"
 			return m, nil
 		}
+		m.err = nil
 		m.status = fmt.Sprintf("%d %s", len(m.rows), m.resource.Title())
 		return m, nil
 	case objectLoadedMsg:
 		m.loading = false
 		m.err = message.err
 		if message.err != nil {
-			m.status = "Get failed"
+			m.errorDialog = true
+			m.status = "Unable to read object"
 			return m, nil
 		}
+		m.err = nil
 		m.object = message.object
 		m.viewport.SetContent(string(message.data))
 		m.viewport.GotoTop()
@@ -239,9 +243,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		if message.err != nil {
-			m.status = "Mutation failed"
+			m.errorDialog = true
+			m.status = "Unable to save object"
 			return m, nil
 		}
+		m.err = nil
 		m.object = message.object
 		m.objectID = m.resource.Row(message.object).ID
 		m.viewport.SetContent(string(message.data))
@@ -254,21 +260,26 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmDelete = false
 		m.err = message.err
 		if message.err != nil {
-			m.status = "Delete failed"
+			m.errorDialog = true
+			m.status = "Unable to delete object"
 			return m, nil
 		}
+		m.err = nil
 		m.screen = listScreen
 		m.status = "Delete completed"
 		return m, m.loadRowsCmd()
 	case editorFinishedMsg:
 		if message.err != nil {
 			m.err = message.err
+			m.errorDialog = true
 			m.status = "Editor failed"
 			return m, nil
 		}
+		m.err = nil
 		object := m.resource.New()
 		if err := yamlcodec.Unmarshal(message.data, object); err != nil {
 			m.err = err
+			m.errorDialog = true
 			m.status = "Invalid YAML"
 			return m, nil
 		}
@@ -276,6 +287,20 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.status = actionProgress[m.action]
 		return m, m.mutationCmd(object)
+	}
+	if m.errorDialog {
+		key, ok := message.(tea.KeyMsg)
+		if !ok {
+			return m, nil
+		}
+		switch key.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "enter", "esc":
+			m.errorDialog = false
+			m.err = nil
+		}
+		return m, nil
 	}
 	if m.commandMode {
 		return m.updateCommand(message)
@@ -322,11 +347,13 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.rows) == 0 {
 			return m, nil
 		}
+		m.err = nil
 		m.loading = true
 		m.objectID = m.rows[m.selected].ID
 		m.status = "Loading object..."
 		return m, m.loadObjectCmd(m.objectID)
 	case "r":
+		m.err = nil
 		m.loading = true
 		m.status = "Refreshing..."
 		return m, m.loadRowsCmd()
@@ -335,16 +362,19 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Resource is read-only"
 			return m, nil
 		}
+		m.err = nil
 		m.action = "create"
 		m.object = m.resource.New()
-		data, err := yamlcodec.Marshal(m.object)
+		data, err := yamlcodec.MarshalTemplate(m.object)
 		if err != nil {
 			m.err = err
+			m.errorDialog = true
 			return m, nil
 		}
 		command, err := m.editCmd(data)
 		if err != nil {
 			m.err = err
+			m.errorDialog = true
 			m.status = "Editor failed"
 			return m, nil
 		}
@@ -370,12 +400,14 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			data, err := yamlcodec.Marshal(m.object)
 			if err != nil {
 				m.err = err
+				m.errorDialog = true
 				return m, nil
 			}
 			m.action = "update"
 			command, err := m.editCmd(data)
 			if err != nil {
 				m.err = err
+				m.errorDialog = true
 				m.status = "Editor failed"
 				return m, nil
 			}
@@ -388,6 +420,7 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.confirmDelete = true
 		case "r":
+			m.err = nil
 			m.loading = true
 			m.status = "Refreshing..."
 			return m, m.loadObjectCmd(m.objectID)
@@ -433,6 +466,7 @@ func (m Model) updateResourceMenu(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.resource = m.resources[m.resourceIndex]
 		m.resourceMenu = false
 		m.selected = 0
+		m.err = nil
 		m.loading = true
 		m.status = "Loading resources..."
 		return m, m.loadRowsCmd()
@@ -490,6 +524,7 @@ func (m Model) selectResource(query string) (tea.Model, tea.Cmd) {
 	m.resourceMenu = false
 	m.screen = listScreen
 	m.selected = 0
+	m.err = nil
 	m.loading = true
 	m.status = "Loading resources..."
 	return m, m.loadRowsCmd()
@@ -510,21 +545,55 @@ func (m Model) View() string {
 		return ""
 	}
 
-	var body string
-	m.viewport.Height = m.bodyHeight()
+	m.viewport.Height = maxInt(m.bodyHeight()-2, 1)
+	if m.errorDialog {
+		return m.errorView()
+	}
 	switch m.screen {
 	case listScreen:
-		body = m.listView()
+		return m.listPage()
 	case detailScreen:
-		body = m.detailView()
+		return m.detailPage()
 	}
+	panic("unknown screen")
+}
 
-	sections := []string{m.headerView(), body}
+func (m Model) errorView() string {
+	width := minInt(maxInt(m.width-4, 1), 100)
+	message := wrapText(m.err.Error(), width-4)
+	body := lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("204")).Render("REQUEST FAILED"),
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(message),
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("enter or esc close"),
+	)
+	dialog := lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("204")).
+		Padding(1, 1).
+		Render(body)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+func (m Model) listPage() string {
+	sections := []string{m.headerView(), m.bodyView()}
 	if m.commandMode {
 		sections = append(sections, m.commandView())
 	}
 	footer := m.footerView()
 	sections = append(sections, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m Model) detailPage() string {
+	sections := []string{m.headerView(), m.detailView()}
+	if m.commandMode {
+		sections = append(sections, m.commandView())
+	}
+	sections = append(sections, m.footerView())
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
@@ -537,17 +606,16 @@ func (m Model) headerView() string {
 	if m.connection.Organization != "" {
 		user += " (" + m.connection.Organization + ")"
 	}
-	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render(
-			fmt.Sprintf("OSAC TUI %s  |  %s", m.tuiVersion, m.resource.Title())),
-		fmt.Sprintf("cluster: %s", m.connection.Address),
-		fmt.Sprintf("user: %s  |  tui: %s  |  osac: %s", user, m.tuiVersion, osacVersion),
-	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render(
+		truncate(fmt.Sprintf("OSAC TUI %s  /  %s", m.tuiVersion, m.resource.Title()), maxInt(m.width-6, 1)))
+	context := fmt.Sprintf("%s  |  %s  |  OSAC %s", m.connection.Address, user, osacVersion)
+	lines := []string{title, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
+		truncate(context, maxInt(m.width-6, 1)))}
 	width := maxInt(m.width-2, 1)
 	return lipgloss.NewStyle().
 		Width(width).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("205")).
+		BorderForeground(lipgloss.Color("99")).
 		Padding(0, 1).
 		Render(strings.Join(lines, "\n"))
 }
@@ -560,82 +628,198 @@ func (m Model) commandView() string {
 		Render(m.commandInput.View())
 }
 
-func (m Model) listView() string {
-	columns := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241"))
-	line := fmt.Sprintf("%-4s %-24s %-18s %-28s %s", "", "NAME", "STATE", "ID", "VERSION")
-	lines := []string{columns.Render(line)}
-	start, end := visibleRows(m.selected, len(m.rows), m.bodyHeight()-1)
-	if start > 0 {
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("  ^ more above"))
+func (m Model) bodyView() string {
+	if !m.resourceMenu {
+		return m.listView(m.width, m.bodyHeight())
 	}
-	for index := start; index < end; index++ {
-		row := m.rows[index]
-		cursor := "  "
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-		if index == m.selected {
-			cursor = "> "
-			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
-		}
-		lines = append(lines, style.Render(fmt.Sprintf("%-4s %-24s %-18s %-28s %s", cursor, row.Name, row.State, row.ID, row.Version)))
+
+	menuWidth := minInt(42, maxInt(m.width/3, 24))
+	if menuWidth >= m.width {
+		menuWidth = maxInt(m.width/2, 1)
 	}
-	if end < len(m.rows) {
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("  v more below"))
-	}
-	if len(m.rows) == 0 && !m.loading {
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("  No resources found"))
-	}
-	if m.resourceMenu {
-		lines = append(lines, "", m.resourceMenuView())
-	}
-	return strings.Join(lines, "\n")
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		m.resourceMenuView(menuWidth, m.bodyHeight()),
+		m.listView(maxInt(m.width-menuWidth, 1), m.bodyHeight()),
+	)
 }
 
 func (m Model) bodyHeight() int {
-	overhead := 6 // header box plus footer
+	overhead := 5
 	if m.commandMode {
-		overhead += 3 // command box
+		overhead += 3
 	}
 	return maxInt(m.height-overhead, 1)
 }
 
-func (m Model) resourceMenuView() string {
-	lines := []string{lipgloss.NewStyle().Bold(true).Render("RESOURCE KINDS")}
-	for index, resource := range m.resources {
+func (m Model) listView(width, height int) string {
+	innerWidth := maxInt(width-4, 1)
+	nameWidth, stateWidth, idWidth, versionWidth := columnWidths(innerWidth)
+	line := truncate(tableLine(nameWidth, stateWidth, idWidth, versionWidth, "", "NAME", "STATE", "ID", "VERSION"), innerWidth)
+	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241")).Render(line)
+	lines := []string{header}
+	capacity := maxInt(height-3, 1)
+	start, end := visibleRows(m.selected, len(m.rows), capacity)
+	for index := start; index < end; index++ {
+		row := m.rows[index]
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 		cursor := "  "
+		if index == m.selected {
+			cursor = "> "
+			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
+		}
+		lines = append(lines, style.Render(truncate(tableLine(
+			nameWidth,
+			stateWidth,
+			idWidth,
+			versionWidth,
+			cursor,
+			row.Name,
+			compactState(row.State),
+			row.ID,
+			row.Version,
+		), innerWidth)))
+	}
+	if len(m.rows) == 0 && !m.loading {
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("No resources found"))
+	}
+	return panel(strings.Join(lines, "\n"), width, height, lipgloss.Color("99"))
+}
+
+func (m Model) resourceMenuView(width, height int) string {
+	innerHeight := maxInt(height-4, 1)
+	start, end := visibleRows(m.resourceIndex, len(m.resources), innerHeight)
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("RESOURCE KINDS"),
+	}
+	for index := start; index < end; index++ {
+		resource := m.resources[index]
+		cursor := "  "
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 		if index == m.resourceIndex {
 			cursor = "> "
+			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
 		}
-		lines = append(lines, fmt.Sprintf("%s%s", cursor, resource.Title()))
+		lines = append(lines, style.Render(cursor+truncate(resource.Title(), maxInt(width-6, 1))))
 	}
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("205")).Padding(0, 1).Render(strings.Join(lines, "\n"))
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
+		fmt.Sprintf("%d kinds  |  j/k move  |  enter select", len(m.resources))))
+	return panel(strings.Join(lines, "\n"), width, height, lipgloss.Color("205"))
 }
 
 func (m Model) detailView() string {
+	content := m.viewport.View()
 	if m.confirmDelete {
 		warning := lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true).Render("Delete this object? [y/N]")
-		return lipgloss.JoinVertical(lipgloss.Left, warning, "", m.viewport.View())
+		content = lipgloss.JoinVertical(lipgloss.Left, warning, "", content)
 	}
-	return m.viewport.View()
+	return panel(content, m.width, m.bodyHeight(), lipgloss.Color("99"))
 }
 
 func (m Model) footerView() string {
-	status := m.status
+	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
 	if m.err != nil {
-		status = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Render(m.err.Error())
+		statusStyle = statusStyle.Foreground(lipgloss.Color("204"))
 	}
-	keyText := "tab resources  : command  enter view  r refresh  q quit"
+	statusText := truncate(m.status, maxInt(m.width/2, 1))
+	status := statusStyle.Render(statusText)
+	keyText := "tab kinds  : command  enter view  r refresh  q quit"
 	if m.commandMode {
 		keyText = "enter select  esc cancel"
 	} else if m.resource.Writable() {
-		keyText = "tab resources  c create  enter view  e edit  d delete  r refresh  q quit"
+		keyText = "tab kinds  c create  enter view  e edit  d delete  r refresh  q quit"
 	}
-	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(keyText)
-	return lipgloss.JoinHorizontal(lipgloss.Left, status, "    ", keys)
+	keyWidth := maxInt(m.width-lipgloss.Width(statusText)-6, 1)
+	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(truncate(keyText, keyWidth))
+	return lipgloss.NewStyle().Width(maxInt(m.width-2, 1)).Render(
+		lipgloss.JoinHorizontal(lipgloss.Left, status, "    ", keys))
+}
+
+func panel(content string, width, height int, border lipgloss.TerminalColor) string {
+	return lipgloss.NewStyle().
+		Width(maxInt(width-2, 1)).
+		Height(maxInt(height, 1)).
+		MaxHeight(maxInt(height, 1)).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(0, 1).
+		Render(content)
+}
+
+func tableLine(nameWidth, stateWidth, idWidth, versionWidth int, cursor, name, state, id, version string) string {
+	return fmt.Sprintf(
+		"%-2s %-*s %-*s %-*s %-*s",
+		cursor,
+		nameWidth,
+		truncate(name, nameWidth),
+		stateWidth,
+		truncate(state, stateWidth),
+		idWidth,
+		truncate(id, idWidth),
+		versionWidth,
+		truncate(version, versionWidth),
+	)
+}
+
+func columnWidths(width int) (int, int, int, int) {
+	nameWidth := maxInt(width/4, 10)
+	stateWidth := maxInt(width/6, 8)
+	idWidth := maxInt(width/3, 12)
+	versionWidth := maxInt(width-nameWidth-stateWidth-idWidth-4, 8)
+	return nameWidth, stateWidth, idWidth, versionWidth
+}
+
+func compactState(state string) string {
+	if separator := strings.LastIndex(state, "_"); separator >= 0 {
+		return state[separator+1:]
+	}
+	return state
+}
+
+func truncate(value string, width int) string {
+	if lipgloss.Width(value) <= width {
+		return value
+	}
+	runes := []rune(value)
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
+}
+
+func wrapText(value string, width int) string {
+	words := strings.Fields(value)
+	lines := make([]string, 0, len(words))
+	line := ""
+	for _, word := range words {
+		if line == "" {
+			line = word
+			continue
+		}
+		candidate := line + " " + word
+		if lipgloss.Width(candidate) <= width {
+			line = candidate
+			continue
+		}
+		lines = append(lines, line)
+		line = word
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func maxInt(value, minimum int) int {
 	if value < minimum {
 		return minimum
+	}
+	return value
+}
+
+func minInt(value, maximum int) int {
+	if value > maximum {
+		return maximum
 	}
 	return value
 }

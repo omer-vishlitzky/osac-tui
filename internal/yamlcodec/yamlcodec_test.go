@@ -37,4 +37,20 @@ func TestRoundTripUsesProtoFieldNames(t *testing.T) {
 	}
 }
 
+func TestMarshalTemplateIncludesEditableStructure(t *testing.T) {
+	data, err := MarshalTemplate(&publicv1.VirtualNetwork{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, field := range []string{"metadata:", "name:", "spec:", "# ipv4_cidr:", "# ipv6_cidr:"} {
+		if !strings.Contains(text, field) {
+			t.Fatalf("template does not contain %q:\n%s", field, text)
+		}
+	}
+	if err := Unmarshal(data, &publicv1.VirtualNetwork{}); err != nil {
+		t.Fatalf("template cannot be decoded: %v\n%s", err, data)
+	}
+}
+
 func stringPtr(value string) *string { return &value }

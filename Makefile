@@ -4,7 +4,7 @@ KUBECONFIG ?= /home/rgolan/.kube/osac-dev-kind-root.kubeconfig
 VERSION ?= dev
 LDFLAGS ?= -X github.com/osac-project/osac-tui/internal/version.Value=$(VERSION)
 
-.PHONY: build test fmt run kind clean
+.PHONY: build test fmt run cluster kind clean
 
 build:
 	$(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/osac-tui
@@ -17,6 +17,9 @@ fmt:
 
 run:
 	$(GO) run ./cmd/osac-tui $(ARGS)
+
+cluster:
+	KUBECONFIG=$(KUBECONFIG) bash ./run-cluster.sh $(ARGS)
 
 kind:
 	KUBECONFIG=$(KUBECONFIG) bash ./run-kind.sh $(ARGS)
