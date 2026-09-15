@@ -50,6 +50,7 @@ on another host port.
 | Key | Action |
 | --- | --- |
 | `tab` | Choose a resource kind |
+| `:` | Open resource command mode |
 | `j`/`k`, arrows | Move through rows or resource kinds |
 | `enter` | Open the selected object |
 | `c` | Create an object with the system editor |
@@ -62,6 +63,11 @@ on another host port.
 The system editor is selected from `VISUAL`, then `EDITOR`, and falls back to
 `vi`. Save and exit the editor to submit the complete protobuf object. Updates
 use the object's `metadata.version` for optimistic locking.
+
+The header shows the connected address, authenticated user and organization,
+TUI version, and OSAC version. Set `OSAC_VERSION` or pass `--osac-version` when
+the API server version is known; the current public API does not expose it
+directly.
 
 ## Scope
 

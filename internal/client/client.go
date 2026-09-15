@@ -3,8 +3,11 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -17,6 +20,12 @@ type Config struct {
 	Address   string
 	TLSConfig *tls.Config
 	Token     string
+}
+
+type ConnectionInfo struct {
+	Address      string
+	User         string
+	Organization string
 }
 
 type Row struct {
@@ -44,6 +53,7 @@ type Client struct {
 	conn      *grpc.ClientConn
 	resources map[string]Resource
 	order     []string
+	info      ConnectionInfo
 }
 
 func Dial(ctx context.Context, config Config) (*Client, error) {
@@ -65,7 +75,12 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	}
 
 	resources := resources(conn)
-	return &Client{conn: conn, resources: resources, order: resourceOrder(resources)}, nil
+	return &Client{
+		conn:      conn,
+		resources: resources,
+		order:     resourceOrder(resources),
+		info:      connectionInfo(config.Address, config.Token),
+	}, nil
 }
 
 func (c *Client) Close() error {
@@ -82,6 +97,44 @@ func (c *Client) Resources() []Resource {
 		result = append(result, c.resources[key])
 	}
 	return result
+}
+
+func (c *Client) ConnectionInfo() ConnectionInfo { return c.info }
+
+func connectionInfo(address, token string) ConnectionInfo {
+	info := ConnectionInfo{Address: address, User: "anonymous"}
+	if token == "" {
+		return info
+	}
+
+	info.User = "authenticated"
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return info
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return info
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return info
+	}
+	for _, key := range []string{"preferred_username", "username", "sub"} {
+		if value, ok := claims[key].(string); ok && value != "" {
+			info.User = value
+			break
+		}
+	}
+	if organization, ok := claims["organization"].(map[string]any); ok {
+		organizations := make([]string, 0, len(organization))
+		for name := range organization {
+			organizations = append(organizations, name)
+		}
+		sort.Strings(organizations)
+		info.Organization = strings.Join(organizations, ", ")
+	}
+	return info
 }
 
 func bearerInterceptor(token string) grpc.UnaryClientInterceptor {

@@ -1,11 +1,13 @@
 GO ?= go
 BINARY ?= osac-tui
 KUBECONFIG ?= /home/rgolan/.kube/osac-dev-kind-root.kubeconfig
+VERSION ?= dev
+LDFLAGS ?= -X github.com/osac-project/osac-tui/internal/version.Value=$(VERSION)
 
 .PHONY: build test fmt run kind clean
 
 build:
-	$(GO) build -o $(BINARY) ./cmd/osac-tui
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/osac-tui
 
 test:
 	$(GO) test ./...

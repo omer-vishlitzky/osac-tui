@@ -13,14 +13,16 @@ import (
 	"github.com/charmbracelet/bubbletea"
 	"github.com/osac-project/osac-tui/internal/client"
 	"github.com/osac-project/osac-tui/internal/ui"
+	"github.com/osac-project/osac-tui/internal/version"
 )
 
 type options struct {
-	address  string
-	tls      bool
-	insecure bool
-	caFile   string
-	token    string
+	address     string
+	tls         bool
+	insecure    bool
+	caFile      string
+	token       string
+	osacVersion string
 }
 
 func main() {
@@ -37,6 +39,7 @@ func run() error {
 	flag.BoolVar(&options.insecure, "insecure", false, "skip TLS certificate verification (unsafe)")
 	flag.StringVar(&options.caFile, "ca-file", "", "PEM file containing an additional CA certificate")
 	flag.StringVar(&options.token, "token", "", "bearer token for the gRPC connection")
+	flag.StringVar(&options.osacVersion, "osac-version", os.Getenv("OSAC_VERSION"), "OSAC API version to display")
 	flag.Parse()
 
 	tlsConfig, err := loadTLSConfig(options)
@@ -57,7 +60,7 @@ func run() error {
 	}
 	defer api.Close()
 
-	_, err = tea.NewProgram(ui.New(api), tea.WithAltScreen()).Run()
+	_, err = tea.NewProgram(ui.New(api, version.Value, options.osacVersion), tea.WithAltScreen()).Run()
 	return err
 }
 

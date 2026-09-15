@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -58,10 +59,13 @@ var actionProgress = map[string]string{
 }
 
 type Model struct {
-	resource  client.Resource
-	resources []client.Resource
-	rows      []client.Row
-	selected  int
+	resource    client.Resource
+	resources   []client.Resource
+	connection  client.ConnectionInfo
+	tuiVersion  string
+	osacVersion string
+	rows        []client.Row
+	selected    int
 
 	screen        screen
 	resourceMenu  bool
@@ -73,20 +77,29 @@ type Model struct {
 	objectID string
 	action   string
 
-	viewport viewport.Model
-	width    int
-	height   int
-	status   string
-	err      error
+	viewport     viewport.Model
+	commandInput textinput.Model
+	commandMode  bool
+	width        int
+	height       int
+	status       string
+	err          error
 }
 
-func New(api *client.Client) Model {
+func New(api *client.Client, tuiVersion, osacVersion string) Model {
 	resources := api.Resources()
+	commandInput := textinput.New()
+	commandInput.Prompt = ":"
+	commandInput.CharLimit = 64
 	model := Model{
-		resources: resources,
-		resource:  resources[0],
-		viewport:  viewport.New(0, 0),
-		status:    "Loading resources...",
+		resources:    resources,
+		resource:     resources[0],
+		connection:   api.ConnectionInfo(),
+		tuiVersion:   tuiVersion,
+		osacVersion:  osacVersion,
+		viewport:     viewport.New(0, 0),
+		commandInput: commandInput,
+		status:       "Loading resources...",
 	}
 	model.loading = true
 	return model
@@ -195,7 +208,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = message.Width
 		m.height = message.Height
 		m.viewport.Width = message.Width - 6
-		m.viewport.Height = message.Height - 9
+		m.viewport.Height = m.bodyHeight()
+		m.commandInput.Width = maxInt(message.Width-8, 1)
 		return m, nil
 	case rowsLoadedMsg:
 		m.loading = false
@@ -262,6 +276,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.status = actionProgress[m.action]
 		return m, m.mutationCmd(object)
+	}
+	if m.commandMode {
+		return m.updateCommand(message)
+	}
+	if key, ok := message.(tea.KeyMsg); ok && key.String() == ":" {
+		m.commandMode = true
+		m.commandInput.Reset()
+		m.commandInput.Focus()
+		m.status = "Command"
+		return m, nil
 	}
 
 	if m.loading {
@@ -416,12 +440,78 @@ func (m Model) updateResourceMenu(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) updateCommand(message tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := message.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "esc":
+			m.commandMode = false
+			m.commandInput.Blur()
+			m.status = fmt.Sprintf("%d %s", len(m.rows), m.resource.Title())
+			return m, nil
+		case "enter":
+			query := strings.TrimSpace(m.commandInput.Value())
+			m.commandMode = false
+			m.commandInput.Blur()
+			return m.selectResource(query)
+		}
+	}
+	var command tea.Cmd
+	m.commandInput, command = m.commandInput.Update(message)
+	return m, command
+}
+
+func (m Model) selectResource(query string) (tea.Model, tea.Cmd) {
+	if query == "" {
+		m.status = "Resource name is required"
+		return m, nil
+	}
+	normalized := normalizeResourceName(query)
+	var matches []client.Resource
+	for _, resource := range m.resources {
+		key := normalizeResourceName(resource.Key())
+		title := normalizeResourceName(resource.Title())
+		if key == normalized || title == normalized {
+			matches = []client.Resource{resource}
+			break
+		}
+		if strings.HasPrefix(key, normalized) || strings.HasPrefix(title, normalized) {
+			matches = append(matches, resource)
+		}
+	}
+	if len(matches) == 0 {
+		m.status = "Unknown resource: " + query
+		return m, nil
+	}
+	if len(matches) > 1 {
+		m.status = "Ambiguous resource: " + query
+		return m, nil
+	}
+	m.resource = matches[0]
+	m.resourceMenu = false
+	m.screen = listScreen
+	m.selected = 0
+	m.loading = true
+	m.status = "Loading resources..."
+	return m, m.loadRowsCmd()
+}
+
+func normalizeResourceName(value string) string {
+	var normalized strings.Builder
+	for _, character := range strings.ToLower(value) {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') {
+			normalized.WriteRune(character)
+		}
+	}
+	return normalized.String()
+}
+
 func (m Model) View() string {
 	if m.width == 0 {
 		return ""
 	}
 
 	var body string
+	m.viewport.Height = m.bodyHeight()
 	switch m.screen {
 	case listScreen:
 		body = m.listView()
@@ -429,18 +519,52 @@ func (m Model) View() string {
 		body = m.detailView()
 	}
 
-	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("OSAC TUI")
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(m.resource.Title())
-	top := lipgloss.JoinHorizontal(lipgloss.Left, header, "  ", title)
+	sections := []string{m.headerView(), body}
+	if m.commandMode {
+		sections = append(sections, m.commandView())
+	}
 	footer := m.footerView()
-	return lipgloss.JoinVertical(lipgloss.Left, top, "", body, "", footer)
+	sections = append(sections, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m Model) headerView() string {
+	osacVersion := m.osacVersion
+	if osacVersion == "" {
+		osacVersion = "unknown"
+	}
+	user := m.connection.User
+	if m.connection.Organization != "" {
+		user += " (" + m.connection.Organization + ")"
+	}
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render(
+			fmt.Sprintf("OSAC TUI %s  |  %s", m.tuiVersion, m.resource.Title())),
+		fmt.Sprintf("cluster: %s", m.connection.Address),
+		fmt.Sprintf("user: %s  |  tui: %s  |  osac: %s", user, m.tuiVersion, osacVersion),
+	}
+	width := maxInt(m.width-2, 1)
+	return lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) commandView() string {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(0, 1).
+		Render(m.commandInput.View())
 }
 
 func (m Model) listView() string {
 	columns := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241"))
 	line := fmt.Sprintf("%-4s %-24s %-18s %-28s %s", "", "NAME", "STATE", "ID", "VERSION")
 	lines := []string{columns.Render(line)}
-	start, end := visibleRows(m.selected, len(m.rows), m.height-11)
+	start, end := visibleRows(m.selected, len(m.rows), m.bodyHeight()-1)
 	if start > 0 {
 		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("  ^ more above"))
 	}
@@ -464,6 +588,14 @@ func (m Model) listView() string {
 		lines = append(lines, "", m.resourceMenuView())
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m Model) bodyHeight() int {
+	overhead := 6 // header box plus footer
+	if m.commandMode {
+		overhead += 3 // command box
+	}
+	return maxInt(m.height-overhead, 1)
 }
 
 func (m Model) resourceMenuView() string {
@@ -491,12 +623,21 @@ func (m Model) footerView() string {
 	if m.err != nil {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Render(m.err.Error())
 	}
-	keyText := "tab resources  enter view  r refresh  q quit"
-	if m.resource.Writable() {
+	keyText := "tab resources  : command  enter view  r refresh  q quit"
+	if m.commandMode {
+		keyText = "enter select  esc cancel"
+	} else if m.resource.Writable() {
 		keyText = "tab resources  c create  enter view  e edit  d delete  r refresh  q quit"
 	}
 	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(keyText)
 	return lipgloss.JoinHorizontal(lipgloss.Left, status, "    ", keys)
+}
+
+func maxInt(value, minimum int) int {
+	if value < minimum {
+		return minimum
+	}
+	return value
 }
 
 func clamp(value, length int) int {
