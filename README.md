@@ -52,16 +52,16 @@ on another host port.
 | `tab` | Choose a resource kind |
 | `j`/`k`, arrows | Move through rows or resource kinds |
 | `enter` | Open the selected object |
-| `c` | Create an object from YAML |
-| `e` | Edit the selected object as YAML |
+| `c` | Create an object with the system editor |
+| `e` | Edit the selected object with the system editor |
 | `d` | Delete the selected object |
 | `r` | Refresh |
-| `ctrl+s` | Submit YAML changes |
 | `esc` | Go back or cancel |
 | `q` | Quit |
 
-The editor submits the complete protobuf object. Updates use the object's
-`metadata.version` for optimistic locking.
+The system editor is selected from `VISUAL`, then `EDITOR`, and falls back to
+`vi`. Save and exit the editor to submit the complete protobuf object. Updates
+use the object's `metadata.version` for optimistic locking.
 
 ## Scope
 

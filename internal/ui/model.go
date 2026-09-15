@@ -3,10 +3,11 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -20,7 +21,6 @@ type screen uint8
 const (
 	listScreen screen = iota
 	detailScreen
-	editorScreen
 )
 
 type rowsLoadedMsg struct {
@@ -41,6 +41,11 @@ type mutationFinishedMsg struct {
 }
 
 type deleteFinishedMsg struct{ err error }
+
+type editorFinishedMsg struct {
+	data []byte
+	err  error
+}
 
 var actionVerbs = map[string]string{
 	"create": "Create",
@@ -69,7 +74,6 @@ type Model struct {
 	action   string
 
 	viewport viewport.Model
-	editor   textarea.Model
 	width    int
 	height   int
 	status   string
@@ -82,11 +86,8 @@ func New(api *client.Client) Model {
 		resources: resources,
 		resource:  resources[0],
 		viewport:  viewport.New(0, 0),
-		editor:    textarea.New(),
 		status:    "Loading resources...",
 	}
-	model.editor.Prompt = "  "
-	model.editor.CharLimit = 0
 	model.loading = true
 	return model
 }
@@ -150,6 +151,44 @@ func (m Model) deleteCmd(id string) tea.Cmd {
 	}
 }
 
+func (m Model) editCmd(data []byte) (tea.Cmd, error) {
+	file, err := os.CreateTemp("", "osac-tui-*.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("create editor file: %w", err)
+	}
+	path := file.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	if _, err := file.Write(data); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("write editor file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("close editor file: %w", err)
+	}
+
+	editor := strings.TrimSpace(os.Getenv("VISUAL"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("EDITOR"))
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	command := exec.Command("sh", "-c", editor+" \"$1\"", "osac-tui-editor", path)
+	return tea.ExecProcess(command, func(err error) tea.Msg {
+		if err != nil {
+			cleanup()
+			return editorFinishedMsg{err: fmt.Errorf("run editor %q: %w", editor, err)}
+		}
+		data, readErr := os.ReadFile(path)
+		cleanup()
+		if readErr != nil {
+			return editorFinishedMsg{err: fmt.Errorf("read editor file: %w", readErr)}
+		}
+		return editorFinishedMsg{data: data}
+	}), nil
+}
+
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
@@ -157,8 +196,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = message.Height
 		m.viewport.Width = message.Width - 6
 		m.viewport.Height = message.Height - 9
-		m.editor.SetWidth(message.Width - 6)
-		m.editor.SetHeight(message.Height - 8)
 		return m, nil
 	case rowsLoadedMsg:
 		m.loading = false
@@ -209,6 +246,22 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = listScreen
 		m.status = "Delete completed"
 		return m, m.loadRowsCmd()
+	case editorFinishedMsg:
+		if message.err != nil {
+			m.err = message.err
+			m.status = "Editor failed"
+			return m, nil
+		}
+		object := m.resource.New()
+		if err := yamlcodec.Unmarshal(message.data, object); err != nil {
+			m.err = err
+			m.status = "Invalid YAML"
+			return m, nil
+		}
+		m.object = object
+		m.loading = true
+		m.status = actionProgress[m.action]
+		return m, m.mutationCmd(object)
 	}
 
 	if m.loading {
@@ -216,9 +269,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
-	}
-	if m.screen == editorScreen {
-		return m.updateEditor(message)
 	}
 	if m.resourceMenu {
 		return m.updateResourceMenu(message)
@@ -268,10 +318,14 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = err
 			return m, nil
 		}
-		m.editor.SetValue(string(data))
-		m.editor.Focus()
-		m.screen = editorScreen
-		m.status = "Create YAML"
+		command, err := m.editCmd(data)
+		if err != nil {
+			m.err = err
+			m.status = "Editor failed"
+			return m, nil
+		}
+		m.status = "Opening editor..."
+		return m, command
 	}
 	return m, nil
 }
@@ -295,10 +349,14 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.action = "update"
-			m.editor.SetValue(string(data))
-			m.editor.Focus()
-			m.screen = editorScreen
-			m.status = "Update YAML"
+			command, err := m.editCmd(data)
+			if err != nil {
+				m.err = err
+				m.status = "Editor failed"
+				return m, nil
+			}
+			m.status = "Opening editor..."
+			return m, command
 		case "d":
 			if !m.resource.Writable() {
 				m.status = "Resource is read-only"
@@ -358,35 +416,6 @@ func (m Model) updateResourceMenu(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) updateEditor(message tea.Msg) (tea.Model, tea.Cmd) {
-	key, ok := message.(tea.KeyMsg)
-	if ok {
-		switch key.String() {
-		case "esc":
-			m.screen = detailScreen
-			if m.action == "create" {
-				m.screen = listScreen
-			}
-			m.status = "Edit cancelled"
-			return m, nil
-		case "ctrl+s":
-			object := m.resource.New()
-			if err := yamlcodec.Unmarshal([]byte(m.editor.Value()), object); err != nil {
-				m.err = err
-				m.status = "Invalid YAML"
-				return m, nil
-			}
-			m.object = object
-			m.loading = true
-			m.status = actionProgress[m.action]
-			return m, m.mutationCmd(object)
-		}
-	}
-	var command tea.Cmd
-	m.editor, command = m.editor.Update(message)
-	return m, command
-}
-
 func (m Model) View() string {
 	if m.width == 0 {
 		return ""
@@ -398,8 +427,6 @@ func (m Model) View() string {
 		body = m.listView()
 	case detailScreen:
 		body = m.detailView()
-	case editorScreen:
-		body = m.editorView()
 	}
 
 	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("OSAC TUI")
@@ -457,11 +484,6 @@ func (m Model) detailView() string {
 		return lipgloss.JoinVertical(lipgloss.Left, warning, "", m.viewport.View())
 	}
 	return m.viewport.View()
-}
-
-func (m Model) editorView() string {
-	label := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("YAML editor  |  ctrl+s submit  |  esc cancel")
-	return lipgloss.JoinVertical(lipgloss.Left, label, m.editor.View())
 }
 
 func (m Model) footerView() string {
