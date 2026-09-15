@@ -257,6 +257,10 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "Refreshing..."
 		return m, m.loadRowsCmd()
 	case "c":
+		if !m.resource.Writable() {
+			m.status = "Resource is read-only"
+			return m, nil
+		}
 		m.action = "create"
 		m.object = m.resource.New()
 		data, err := yamlcodec.Marshal(m.object)
@@ -281,6 +285,10 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = listScreen
 			m.status = fmt.Sprintf("%d %s", len(m.rows), m.resource.Title())
 		case "e":
+			if !m.resource.Writable() {
+				m.status = "Resource is read-only"
+				return m, nil
+			}
 			data, err := yamlcodec.Marshal(m.object)
 			if err != nil {
 				m.err = err
@@ -292,6 +300,10 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = editorScreen
 			m.status = "Update YAML"
 		case "d":
+			if !m.resource.Writable() {
+				m.status = "Resource is read-only"
+				return m, nil
+			}
 			m.confirmDelete = true
 		case "r":
 			m.loading = true
@@ -457,7 +469,11 @@ func (m Model) footerView() string {
 	if m.err != nil {
 		status = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Render(m.err.Error())
 	}
-	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("tab resources  c create  e edit  d delete  r refresh  q quit")
+	keyText := "tab resources  enter view  r refresh  q quit"
+	if m.resource.Writable() {
+		keyText = "tab resources  c create  enter view  e edit  d delete  r refresh  q quit"
+	}
+	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(keyText)
 	return lipgloss.JoinHorizontal(lipgloss.Left, status, "    ", keys)
 }
 

@@ -65,9 +65,8 @@ The editor submits the complete protobuf object. Updates use the object's
 
 ## Scope
 
-The client currently registers the public CRUD resources most useful when
-operating infrastructure: `clusters`, `computeinstances`, `virtualnetworks`,
-`subnets`, and `securitygroups`. The registry is deliberately typed so adding
-another generated service is a small, compile-time checked adapter rather than
-reflection-driven CRUD.
+The client discovers every listable entity service in the public API. Full CRUD
+services support create, update, and delete; read-only services such as catalog
+and storage resources support listing and inspection only. Non-resource APIs
+such as events and console streaming are not shown as resource kinds.
 # osac-tui

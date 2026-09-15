@@ -4,9 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"strconv"
+	"sort"
 
-	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,6 +37,7 @@ type Resource interface {
 	Delete(context.Context, string) error
 	New() proto.Message
 	Row(proto.Message) Row
+	Writable() bool
 }
 
 type Client struct {
@@ -92,27 +92,10 @@ func bearerInterceptor(token string) grpc.UnaryClientInterceptor {
 }
 
 func resourceOrder(resources map[string]Resource) []string {
-	keys := []string{
-		"clusters",
-		"computeinstances",
-		"virtualnetworks",
-		"subnets",
-		"securitygroups",
+	keys := make([]string, 0, len(resources))
+	for key := range resources {
+		keys = append(keys, key)
 	}
-	for _, key := range keys {
-		if resources[key] == nil {
-			panic("resource registry is missing " + key)
-		}
-	}
+	sort.Strings(keys)
 	return keys
-}
-
-func metadataRow(object proto.Message, metadata *publicv1.Metadata, id, state string) Row {
-	return Row{
-		Object:  object,
-		ID:      id,
-		Name:    metadata.GetName(),
-		State:   state,
-		Version: strconv.FormatInt(int64(metadata.GetVersion()), 10),
-	}
 }
