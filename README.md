@@ -27,6 +27,23 @@ go run ./cmd/osac-tui \
 ```
 
 Use `--ca-file` when the service certificate is signed by a private CA.
+For development-only connections, `--insecure` skips TLS certificate verification.
+
+### Kind dev cluster
+
+The dev cluster already has an accepted `TLSRoute` for
+`fulfillment-api.osac.localhost` and exposes the Gateway on host port `8443`.
+Run the helper below to use the kubeconfig at
+`/home/rgolan/.kube/osac-dev-kind-root.kubeconfig` and start the TUI with the
+cluster CA and dev user token:
+
+```sh
+bash ./run-kind.sh
+```
+
+Set `OSAC_USER` to use another seeded user, or set `OSAC_TOKEN` to skip the
+Keycloak token request. Override `OSAC_GATEWAY_PORT` if the Gateway is exposed
+on another host port.
 
 ## Keys
 

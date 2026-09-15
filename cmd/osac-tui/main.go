@@ -16,10 +16,11 @@ import (
 )
 
 type options struct {
-	address string
-	tls     bool
-	caFile  string
-	token   string
+	address  string
+	tls      bool
+	insecure bool
+	caFile   string
+	token    string
 }
 
 func main() {
@@ -33,6 +34,7 @@ func run() error {
 	var options options
 	flag.StringVar(&options.address, "address", "localhost:8000", "fulfillment-service gRPC address")
 	flag.BoolVar(&options.tls, "tls", false, "use TLS for the gRPC connection")
+	flag.BoolVar(&options.insecure, "insecure", false, "skip TLS certificate verification (unsafe)")
 	flag.StringVar(&options.caFile, "ca-file", "", "PEM file containing an additional CA certificate")
 	flag.StringVar(&options.token, "token", "", "bearer token for the gRPC connection")
 	flag.Parse()
@@ -60,6 +62,9 @@ func run() error {
 }
 
 func loadTLSConfig(options options) (*tls.Config, error) {
+	if !options.tls && options.insecure {
+		return nil, errors.New("--insecure requires --tls")
+	}
 	if !options.tls && options.caFile != "" {
 		return nil, errors.New("--ca-file requires --tls")
 	}
@@ -67,7 +72,10 @@ func loadTLSConfig(options options) (*tls.Config, error) {
 		return nil, nil
 	}
 
-	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	config := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: options.insecure,
+	}
 	if options.caFile == "" {
 		return config, nil
 	}
