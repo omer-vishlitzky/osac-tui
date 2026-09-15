@@ -27,30 +27,52 @@ go run ./cmd/osac-tui \
 ```
 
 Use `--ca-file` when the service certificate is signed by a private CA.
+For development-only connections, `--insecure` skips TLS certificate verification.
+
+### Kind dev cluster
+
+The dev cluster already has an accepted `TLSRoute` for
+`fulfillment-api.osac.localhost` and exposes the Gateway on host port `8443`.
+Run the helper below to use the kubeconfig at
+`/home/rgolan/.kube/osac-dev-kind-root.kubeconfig` and start the TUI with the
+cluster CA and dev user token:
+
+```sh
+bash ./run-kind.sh
+```
+
+Set `OSAC_USER` to use another seeded user, or set `OSAC_TOKEN` to skip the
+Keycloak token request. Override `OSAC_GATEWAY_PORT` if the Gateway is exposed
+on another host port.
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | `tab` | Choose a resource kind |
+| `:` | Open resource command mode |
 | `j`/`k`, arrows | Move through rows or resource kinds |
 | `enter` | Open the selected object |
-| `c` | Create an object from YAML |
-| `e` | Edit the selected object as YAML |
+| `c` | Create an object with the system editor |
+| `e` | Edit the selected object with the system editor |
 | `d` | Delete the selected object |
 | `r` | Refresh |
-| `ctrl+s` | Submit YAML changes |
 | `esc` | Go back or cancel |
 | `q` | Quit |
 
-The editor submits the complete protobuf object. Updates use the object's
-`metadata.version` for optimistic locking.
+The system editor is selected from `VISUAL`, then `EDITOR`, and falls back to
+`vi`. Save and exit the editor to submit the complete protobuf object. Updates
+use the object's `metadata.version` for optimistic locking.
+
+The header shows the connected address, authenticated user and organization,
+TUI version, and OSAC version. Set `OSAC_VERSION` or pass `--osac-version` when
+the API server version is known; the current public API does not expose it
+directly.
 
 ## Scope
 
-The client currently registers the public CRUD resources most useful when
-operating infrastructure: `clusters`, `computeinstances`, `virtualnetworks`,
-`subnets`, and `securitygroups`. The registry is deliberately typed so adding
-another generated service is a small, compile-time checked adapter rather than
-reflection-driven CRUD.
+The client discovers every listable entity service in the public API. Full CRUD
+services support create, update, and delete; read-only services such as catalog
+and storage resources support listing and inspection only. Non-resource APIs
+such as events and console streaming are not shown as resource kinds.
 # osac-tui

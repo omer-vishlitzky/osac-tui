@@ -3,10 +3,12 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"strconv"
+	"sort"
+	"strings"
 
-	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -18,6 +20,12 @@ type Config struct {
 	Address   string
 	TLSConfig *tls.Config
 	Token     string
+}
+
+type ConnectionInfo struct {
+	Address      string
+	User         string
+	Organization string
 }
 
 type Row struct {
@@ -38,12 +46,14 @@ type Resource interface {
 	Delete(context.Context, string) error
 	New() proto.Message
 	Row(proto.Message) Row
+	Writable() bool
 }
 
 type Client struct {
 	conn      *grpc.ClientConn
 	resources map[string]Resource
 	order     []string
+	info      ConnectionInfo
 }
 
 func Dial(ctx context.Context, config Config) (*Client, error) {
@@ -65,7 +75,12 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	}
 
 	resources := resources(conn)
-	return &Client{conn: conn, resources: resources, order: resourceOrder(resources)}, nil
+	return &Client{
+		conn:      conn,
+		resources: resources,
+		order:     resourceOrder(resources),
+		info:      connectionInfo(config.Address, config.Token),
+	}, nil
 }
 
 func (c *Client) Close() error {
@@ -84,6 +99,44 @@ func (c *Client) Resources() []Resource {
 	return result
 }
 
+func (c *Client) ConnectionInfo() ConnectionInfo { return c.info }
+
+func connectionInfo(address, token string) ConnectionInfo {
+	info := ConnectionInfo{Address: address, User: "anonymous"}
+	if token == "" {
+		return info
+	}
+
+	info.User = "authenticated"
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return info
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return info
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return info
+	}
+	for _, key := range []string{"preferred_username", "username", "sub"} {
+		if value, ok := claims[key].(string); ok && value != "" {
+			info.User = value
+			break
+		}
+	}
+	if organization, ok := claims["organization"].(map[string]any); ok {
+		organizations := make([]string, 0, len(organization))
+		for name := range organization {
+			organizations = append(organizations, name)
+		}
+		sort.Strings(organizations)
+		info.Organization = strings.Join(organizations, ", ")
+	}
+	return info
+}
+
 func bearerInterceptor(token string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, request, reply interface{}, conn *grpc.ClientConn, invoker grpc.UnaryInvoker, options ...grpc.CallOption) error {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
@@ -92,27 +145,10 @@ func bearerInterceptor(token string) grpc.UnaryClientInterceptor {
 }
 
 func resourceOrder(resources map[string]Resource) []string {
-	keys := []string{
-		"clusters",
-		"computeinstances",
-		"virtualnetworks",
-		"subnets",
-		"securitygroups",
+	keys := make([]string, 0, len(resources))
+	for key := range resources {
+		keys = append(keys, key)
 	}
-	for _, key := range keys {
-		if resources[key] == nil {
-			panic("resource registry is missing " + key)
-		}
-	}
+	sort.Strings(keys)
 	return keys
-}
-
-func metadataRow(object proto.Message, metadata *publicv1.Metadata, id, state string) Row {
-	return Row{
-		Object:  object,
-		ID:      id,
-		Name:    metadata.GetName(),
-		State:   state,
-		Version: strconv.FormatInt(int64(metadata.GetVersion()), 10),
-	}
 }

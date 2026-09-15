@@ -2,31 +2,46 @@ package client
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode"
 
-	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
+	_ "github.com/osac-project/osac/proto/gen/osac/public/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+var errReadOnly = errors.New("resource is read-only")
+
 type resource struct {
-	key    string
-	title  string
-	list   func(context.Context) ([]Row, error)
-	get    func(context.Context, string) (proto.Message, error)
-	create func(context.Context, proto.Message) (proto.Message, error)
-	update func(context.Context, proto.Message) (proto.Message, error)
-	delete func(context.Context, string) error
-	new    func() proto.Message
-	row    func(proto.Message) Row
+	key      string
+	title    string
+	writable bool
+	list     func(context.Context) ([]Row, error)
+	get      func(context.Context, string) (proto.Message, error)
+	create   func(context.Context, proto.Message) (proto.Message, error)
+	update   func(context.Context, proto.Message) (proto.Message, error)
+	delete   func(context.Context, string) error
+	new      func() proto.Message
+	row      func(proto.Message) Row
 }
 
 func (r resource) Key() string { return r.key }
 
 func (r resource) Title() string { return r.title }
 
+func (r resource) Writable() bool { return r.writable }
+
 func (r resource) List(ctx context.Context) ([]Row, error) { return r.list(ctx) }
 
-func (r resource) Get(ctx context.Context, id string) (proto.Message, error) { return r.get(ctx, id) }
+func (r resource) Get(ctx context.Context, id string) (proto.Message, error) {
+	return r.get(ctx, id)
+}
 
 func (r resource) Create(ctx context.Context, object proto.Message) (proto.Message, error) {
 	return r.create(ctx, object)
@@ -43,256 +58,250 @@ func (r resource) New() proto.Message { return r.new() }
 func (r resource) Row(object proto.Message) Row { return r.row(object) }
 
 func resources(conn *grpc.ClientConn) map[string]Resource {
-	return map[string]Resource{
-		"clusters":         clusterResource(publicv1.NewClustersClient(conn)),
-		"computeinstances": computeInstanceResource(publicv1.NewComputeInstancesClient(conn)),
-		"virtualnetworks":  virtualNetworkResource(publicv1.NewVirtualNetworksClient(conn)),
-		"subnets":          subnetResource(publicv1.NewSubnetsClient(conn)),
-		"securitygroups":   securityGroupResource(publicv1.NewSecurityGroupsClient(conn)),
-	}
+	result := make(map[string]Resource)
+	protoregistry.GlobalFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
+		if string(file.Package()) != "osac.public.v1" {
+			return true
+		}
+		for index := 0; index < file.Services().Len(); index++ {
+			service := file.Services().Get(index)
+			if service.Methods().ByName("List") == nil || service.Methods().ByName("Get") == nil {
+				continue
+			}
+			resource := newResource(conn, service)
+			result[resource.Key()] = resource
+		}
+		return true
+	})
+	return result
 }
 
-func clusterResource(service publicv1.ClustersClient) Resource {
+func newResource(conn *grpc.ClientConn, service protoreflect.ServiceDescriptor) Resource {
+	listMethod := service.Methods().ByName("List")
+	getMethod := service.Methods().ByName("Get")
+	createMethod := service.Methods().ByName("Create")
+	updateMethod := service.Methods().ByName("Update")
+	deleteMethod := service.Methods().ByName("Delete")
+
+	objectField := getMethod.Output().Fields().ByName("object")
+	if objectField == nil || objectField.Kind() != protoreflect.MessageKind {
+		panic("resource Get response has no object field: " + string(service.FullName()))
+	}
+	objectDescriptor := objectField.Message()
+	writable := createMethod != nil && updateMethod != nil && deleteMethod != nil
+
 	return resource{
-		key:   "clusters",
-		title: "Clusters",
+		key:      strings.ToLower(string(service.Name())),
+		title:    resourceTitle(string(service.Name())),
+		writable: writable,
 		list: func(ctx context.Context) ([]Row, error) {
-			response, err := service.List(ctx, &publicv1.ClustersListRequest{})
+			request := dynamicpb.NewMessage(listMethod.Input())
+			response, err := invokeResourceMethod(ctx, conn, listMethod, request)
 			if err != nil {
 				return nil, err
 			}
-			rows := make([]Row, 0, len(response.GetItems()))
-			for _, object := range response.GetItems() {
-				rows = append(rows, clusterRow(object))
+			itemsField := response.ProtoReflect().Descriptor().Fields().ByName("items")
+			if itemsField == nil || itemsField.Cardinality() != protoreflect.Repeated {
+				return nil, fmt.Errorf("resource List response has no items field: %s", service.FullName())
+			}
+			items := response.ProtoReflect().Get(itemsField).List()
+			rows := make([]Row, 0, items.Len())
+			for index := 0; index < items.Len(); index++ {
+				rows = append(rows, reflectedRow(items.Get(index).Message().Interface()))
 			}
 			return rows, nil
 		},
 		get: func(ctx context.Context, id string) (proto.Message, error) {
-			response, err := service.Get(ctx, &publicv1.ClustersGetRequest{Id: id})
+			request := dynamicpb.NewMessage(getMethod.Input())
+			if err := setStringField(request, "id", id); err != nil {
+				return nil, err
+			}
+			response, err := invokeResourceMethod(ctx, conn, getMethod, request)
 			if err != nil {
 				return nil, err
 			}
-			return response.GetObject(), nil
+			return responseObject(response)
 		},
-		create: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Create(ctx, &publicv1.ClustersCreateRequest{Object: message.(*publicv1.Cluster)})
+		create: func(ctx context.Context, object proto.Message) (proto.Message, error) {
+			if createMethod == nil {
+				return nil, errReadOnly
+			}
+			request := dynamicpb.NewMessage(createMethod.Input())
+			if err := setMessageField(request, "object", object); err != nil {
+				return nil, err
+			}
+			response, err := invokeResourceMethod(ctx, conn, createMethod, request)
 			if err != nil {
 				return nil, err
 			}
-			return response.GetObject(), nil
+			return responseObject(response)
 		},
-		update: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Update(ctx, &publicv1.ClustersUpdateRequest{Object: message.(*publicv1.Cluster), Lock: true})
+		update: func(ctx context.Context, object proto.Message) (proto.Message, error) {
+			if updateMethod == nil {
+				return nil, errReadOnly
+			}
+			request := dynamicpb.NewMessage(updateMethod.Input())
+			if err := setMessageField(request, "object", object); err != nil {
+				return nil, err
+			}
+			if err := setBoolField(request, "lock", true); err != nil {
+				return nil, err
+			}
+			response, err := invokeResourceMethod(ctx, conn, updateMethod, request)
 			if err != nil {
 				return nil, err
 			}
-			return response.GetObject(), nil
+			return responseObject(response)
 		},
 		delete: func(ctx context.Context, id string) error {
-			_, err := service.Delete(ctx, &publicv1.ClustersDeleteRequest{Id: id})
+			if deleteMethod == nil {
+				return errReadOnly
+			}
+			request := dynamicpb.NewMessage(deleteMethod.Input())
+			if err := setStringField(request, "id", id); err != nil {
+				return err
+			}
+			_, err := invokeResourceMethod(ctx, conn, deleteMethod, request)
 			return err
 		},
-		new: func() proto.Message { return &publicv1.Cluster{} },
-		row: func(object proto.Message) Row { return clusterRow(object.(*publicv1.Cluster)) },
+		new: func() proto.Message { return dynamicpb.NewMessage(objectDescriptor) },
+		row: reflectedRow,
 	}
 }
 
-func clusterRow(object *publicv1.Cluster) Row {
-	return metadataRow(object, object.GetMetadata(), object.GetId(), object.GetStatus().GetState().String())
+func invokeResourceMethod(ctx context.Context, conn *grpc.ClientConn, method protoreflect.MethodDescriptor, request proto.Message) (proto.Message, error) {
+	response := dynamicpb.NewMessage(method.Output())
+	if err := conn.Invoke(ctx, resourceMethodName(method), request, response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
-func computeInstanceResource(service publicv1.ComputeInstancesClient) Resource {
-	return resource{
-		key:   "computeinstances",
-		title: "Compute Instances",
-		list: func(ctx context.Context) ([]Row, error) {
-			response, err := service.List(ctx, &publicv1.ComputeInstancesListRequest{})
-			if err != nil {
-				return nil, err
-			}
-			rows := make([]Row, 0, len(response.GetItems()))
-			for _, object := range response.GetItems() {
-				rows = append(rows, computeInstanceRow(object))
-			}
-			return rows, nil
-		},
-		get: func(ctx context.Context, id string) (proto.Message, error) {
-			response, err := service.Get(ctx, &publicv1.ComputeInstancesGetRequest{Id: id})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		create: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Create(ctx, &publicv1.ComputeInstancesCreateRequest{Object: message.(*publicv1.ComputeInstance)})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		update: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Update(ctx, &publicv1.ComputeInstancesUpdateRequest{Object: message.(*publicv1.ComputeInstance), Lock: true})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		delete: func(ctx context.Context, id string) error {
-			_, err := service.Delete(ctx, &publicv1.ComputeInstancesDeleteRequest{Id: id})
-			return err
-		},
-		new: func() proto.Message { return &publicv1.ComputeInstance{} },
-		row: func(object proto.Message) Row { return computeInstanceRow(object.(*publicv1.ComputeInstance)) },
+func resourceMethodName(method protoreflect.MethodDescriptor) string {
+	return "/" + string(method.Parent().FullName()) + "/" + string(method.Name())
+}
+
+func responseObject(response proto.Message) (proto.Message, error) {
+	field := response.ProtoReflect().Descriptor().Fields().ByName("object")
+	if field == nil || field.Kind() != protoreflect.MessageKind {
+		return nil, errors.New("resource response has no object field")
+	}
+	return response.ProtoReflect().Get(field).Message().Interface(), nil
+}
+
+func setStringField(message *dynamicpb.Message, name, value string) error {
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.StringKind {
+		return fmt.Errorf("request has no string field %q", name)
+	}
+	message.Set(field, protoreflect.ValueOfString(value))
+	return nil
+}
+
+func setBoolField(message *dynamicpb.Message, name string, value bool) error {
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.BoolKind {
+		return fmt.Errorf("request has no bool field %q", name)
+	}
+	message.Set(field, protoreflect.ValueOfBool(value))
+	return nil
+}
+
+func setMessageField(message *dynamicpb.Message, name string, object proto.Message) error {
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.MessageKind {
+		return fmt.Errorf("request has no message field %q", name)
+	}
+	if object == nil || object.ProtoReflect().Descriptor().FullName() != field.Message().FullName() {
+		return fmt.Errorf("request field %q has an incompatible message type", name)
+	}
+	message.Set(field, protoreflect.ValueOfMessage(object.ProtoReflect()))
+	return nil
+}
+
+func resourceTitle(name string) string {
+	runes := []rune(name)
+	words := make([]string, 0, 4)
+	start := 0
+	for index := 1; index < len(runes); index++ {
+		if !unicode.IsUpper(runes[index]) {
+			continue
+		}
+		previousLower := unicode.IsLower(runes[index-1])
+		nextLower := index+1 < len(runes) && unicode.IsLower(runes[index+1])
+		if previousLower || nextLower {
+			words = append(words, string(runes[start:index]))
+			start = index
+		}
+	}
+	words = append(words, string(runes[start:]))
+	return strings.Join(words, " ")
+}
+
+func reflectedRow(object proto.Message) Row {
+	message := object.ProtoReflect()
+	metadata := nestedMessage(message, "metadata")
+	status := nestedMessage(message, "status")
+	return Row{
+		Object:  object,
+		ID:      stringField(message, "id"),
+		Name:    stringField(metadata, "name"),
+		State:   enumField(status, "state"),
+		Version: versionField(metadata),
 	}
 }
 
-func computeInstanceRow(object *publicv1.ComputeInstance) Row {
-	return metadataRow(object, object.GetMetadata(), object.GetId(), object.GetStatus().GetState().String())
-}
-
-func virtualNetworkResource(service publicv1.VirtualNetworksClient) Resource {
-	return resource{
-		key:   "virtualnetworks",
-		title: "Virtual Networks",
-		list: func(ctx context.Context) ([]Row, error) {
-			response, err := service.List(ctx, &publicv1.VirtualNetworksListRequest{})
-			if err != nil {
-				return nil, err
-			}
-			rows := make([]Row, 0, len(response.GetItems()))
-			for _, object := range response.GetItems() {
-				rows = append(rows, virtualNetworkRow(object))
-			}
-			return rows, nil
-		},
-		get: func(ctx context.Context, id string) (proto.Message, error) {
-			response, err := service.Get(ctx, &publicv1.VirtualNetworksGetRequest{Id: id})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		create: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Create(ctx, &publicv1.VirtualNetworksCreateRequest{Object: message.(*publicv1.VirtualNetwork)})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		update: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Update(ctx, &publicv1.VirtualNetworksUpdateRequest{Object: message.(*publicv1.VirtualNetwork), Lock: true})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		delete: func(ctx context.Context, id string) error {
-			_, err := service.Delete(ctx, &publicv1.VirtualNetworksDeleteRequest{Id: id})
-			return err
-		},
-		new: func() proto.Message { return &publicv1.VirtualNetwork{} },
-		row: func(object proto.Message) Row { return virtualNetworkRow(object.(*publicv1.VirtualNetwork)) },
+func nestedMessage(message protoreflect.Message, name string) protoreflect.Message {
+	if message == nil {
+		return nil
 	}
-}
-
-func virtualNetworkRow(object *publicv1.VirtualNetwork) Row {
-	return metadataRow(object, object.GetMetadata(), object.GetId(), object.GetStatus().GetState().String())
-}
-
-func subnetResource(service publicv1.SubnetsClient) Resource {
-	return resource{
-		key:   "subnets",
-		title: "Subnets",
-		list: func(ctx context.Context) ([]Row, error) {
-			response, err := service.List(ctx, &publicv1.SubnetsListRequest{})
-			if err != nil {
-				return nil, err
-			}
-			rows := make([]Row, 0, len(response.GetItems()))
-			for _, object := range response.GetItems() {
-				rows = append(rows, subnetRow(object))
-			}
-			return rows, nil
-		},
-		get: func(ctx context.Context, id string) (proto.Message, error) {
-			response, err := service.Get(ctx, &publicv1.SubnetsGetRequest{Id: id})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		create: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Create(ctx, &publicv1.SubnetsCreateRequest{Object: message.(*publicv1.Subnet)})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		update: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Update(ctx, &publicv1.SubnetsUpdateRequest{Object: message.(*publicv1.Subnet), Lock: true})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		delete: func(ctx context.Context, id string) error {
-			_, err := service.Delete(ctx, &publicv1.SubnetsDeleteRequest{Id: id})
-			return err
-		},
-		new: func() proto.Message { return &publicv1.Subnet{} },
-		row: func(object proto.Message) Row { return subnetRow(object.(*publicv1.Subnet)) },
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.MessageKind || !message.Has(field) {
+		return nil
 	}
+	return message.Get(field).Message()
 }
 
-func subnetRow(object *publicv1.Subnet) Row {
-	return metadataRow(object, object.GetMetadata(), object.GetId(), object.GetStatus().GetState().String())
-}
-
-func securityGroupResource(service publicv1.SecurityGroupsClient) Resource {
-	return resource{
-		key:   "securitygroups",
-		title: "Security Groups",
-		list: func(ctx context.Context) ([]Row, error) {
-			response, err := service.List(ctx, &publicv1.SecurityGroupsListRequest{})
-			if err != nil {
-				return nil, err
-			}
-			rows := make([]Row, 0, len(response.GetItems()))
-			for _, object := range response.GetItems() {
-				rows = append(rows, securityGroupRow(object))
-			}
-			return rows, nil
-		},
-		get: func(ctx context.Context, id string) (proto.Message, error) {
-			response, err := service.Get(ctx, &publicv1.SecurityGroupsGetRequest{Id: id})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		create: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Create(ctx, &publicv1.SecurityGroupsCreateRequest{Object: message.(*publicv1.SecurityGroup)})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		update: func(ctx context.Context, message proto.Message) (proto.Message, error) {
-			response, err := service.Update(ctx, &publicv1.SecurityGroupsUpdateRequest{Object: message.(*publicv1.SecurityGroup), Lock: true})
-			if err != nil {
-				return nil, err
-			}
-			return response.GetObject(), nil
-		},
-		delete: func(ctx context.Context, id string) error {
-			_, err := service.Delete(ctx, &publicv1.SecurityGroupsDeleteRequest{Id: id})
-			return err
-		},
-		new: func() proto.Message { return &publicv1.SecurityGroup{} },
-		row: func(object proto.Message) Row { return securityGroupRow(object.(*publicv1.SecurityGroup)) },
+func stringField(message protoreflect.Message, name string) string {
+	if message == nil {
+		return ""
 	}
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.StringKind {
+		return ""
+	}
+	return message.Get(field).String()
 }
 
-func securityGroupRow(object *publicv1.SecurityGroup) Row {
-	return metadataRow(object, object.GetMetadata(), object.GetId(), object.GetStatus().GetState().String())
+func enumField(message protoreflect.Message, name string) string {
+	if message == nil {
+		return ""
+	}
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.EnumKind {
+		return ""
+	}
+	value := field.Enum().Values().ByNumber(message.Get(field).Enum())
+	if value == nil {
+		return strconv.FormatInt(int64(message.Get(field).Enum()), 10)
+	}
+	return string(value.Name())
+}
+
+func versionField(message protoreflect.Message) string {
+	if message == nil {
+		return ""
+	}
+	field := message.Descriptor().Fields().ByName("version")
+	if field == nil {
+		return ""
+	}
+	switch field.Kind() {
+	case protoreflect.Int32Kind, protoreflect.Int64Kind, protoreflect.Sint32Kind, protoreflect.Sint64Kind:
+		return strconv.FormatInt(message.Get(field).Int(), 10)
+	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
+		return strconv.FormatUint(message.Get(field).Uint(), 10)
+	default:
+		return ""
+	}
 }
