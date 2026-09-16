@@ -6,18 +6,26 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/osac-project/osac-tui/internal/client"
 	"google.golang.org/protobuf/proto"
 )
 
 type testResource struct {
-	key string
+	key   string
+	title string
 }
 
 func (r testResource) Key() string { return r.key }
 
-func (r testResource) Title() string { return r.key }
+func (r testResource) Title() string {
+	if r.title != "" {
+		return r.title
+	}
+	return r.key
+}
 
 func (r testResource) List(context.Context) ([]client.Row, error) { return nil, nil }
 
@@ -136,5 +144,90 @@ func TestErrorDialogShowsRawRPCError(t *testing.T) {
 	}
 	if got := lipgloss.Width(view); got > model.width {
 		t.Fatalf("dialog width = %d, want at most %d", got, model.width)
+	}
+}
+
+func TestResourceSearchMatchesKeysTitlesAndSubstrings(t *testing.T) {
+	resources := []client.Resource{
+		testResource{key: "projectmemberships", title: "Project Memberships"},
+		testResource{key: "projects", title: "Projects"},
+		testResource{key: "clustertemplates", title: "Cluster Templates"},
+	}
+
+	if got := matchingResourceIndexes(resources, "projects"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("exact resource match = %v, want [1]", got)
+	}
+	if got := matchingResourceIndexes(resources, "member"); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("substring resource match = %v, want [0]", got)
+	}
+	if got := matchingResourceIndexes(resources, "cluster temp"); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("title resource match = %v, want [2]", got)
+	}
+}
+
+func TestCommandCompletionCyclesAndSelectsSuggestion(t *testing.T) {
+	resources := []client.Resource{
+		testResource{key: "projectmemberships", title: "Project Memberships"},
+		testResource{key: "projects", title: "Projects"},
+	}
+	input := textinput.New()
+	input.Prompt = ":"
+	input.ShowSuggestions = true
+	input.SetSuggestions(resourceCompletionSuggestions(resources, ""))
+	input.Focus()
+	model := Model{resources: resources, resource: resources[0], commandInput: input, commandMode: true}
+
+	updated, _ := model.updateCommand(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model = updated.(Model)
+	if got := model.commandInput.CurrentSuggestion(); got != "projectmemberships" {
+		t.Fatalf("first completion = %q, want projectmemberships", got)
+	}
+
+	updated, _ = model.updateCommand(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if got := model.commandInput.CurrentSuggestion(); got != "projects" {
+		t.Fatalf("cycled completion = %q, want projects", got)
+	}
+
+	updated, _ = model.updateCommand(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if got := model.resource.Key(); got != "projects" {
+		t.Fatalf("selected resource = %q, want projects", got)
+	}
+}
+
+func TestResourceMenuSearchCyclesAndSelectsSuggestion(t *testing.T) {
+	resources := []client.Resource{
+		testResource{key: "projectmemberships", title: "Project Memberships"},
+		testResource{key: "projects", title: "Projects"},
+	}
+	search := textinput.New()
+	search.Prompt = "/"
+	search.ShowSuggestions = true
+	search.SetSuggestions(resourceCompletionSuggestions(resources, ""))
+	search.Focus()
+	model := Model{
+		resources:      resources,
+		resource:       resources[0],
+		resourceMenu:   true,
+		resourceSearch: search,
+	}
+
+	updated, _ := model.updateResourceMenu(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	model = updated.(Model)
+	if got := model.resourceSearch.CurrentSuggestion(); got != "projectmemberships" {
+		t.Fatalf("first menu completion = %q, want projectmemberships", got)
+	}
+
+	updated, _ = model.updateResourceMenu(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if got := model.resourceSearch.CurrentSuggestion(); got != "projects" {
+		t.Fatalf("cycled menu completion = %q, want projects", got)
+	}
+
+	updated, _ = model.updateResourceMenu(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if got := model.resource.Key(); got != "projects" {
+		t.Fatalf("selected menu resource = %q, want projects", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -77,14 +78,15 @@ type Model struct {
 	objectID string
 	action   string
 
-	viewport     viewport.Model
-	commandInput textinput.Model
-	commandMode  bool
-	width        int
-	height       int
-	status       string
-	err          error
-	errorDialog  bool
+	viewport       viewport.Model
+	commandInput   textinput.Model
+	resourceSearch textinput.Model
+	commandMode    bool
+	width          int
+	height         int
+	status         string
+	err            error
+	errorDialog    bool
 }
 
 func New(api *client.Client, tuiVersion, osacVersion string) Model {
@@ -92,16 +94,24 @@ func New(api *client.Client, tuiVersion, osacVersion string) Model {
 	commandInput := textinput.New()
 	commandInput.Prompt = ":"
 	commandInput.CharLimit = 64
+	commandInput.ShowSuggestions = true
+	resourceSearch := textinput.New()
+	resourceSearch.Prompt = "/"
+	resourceSearch.CharLimit = 64
+	resourceSearch.ShowSuggestions = true
 	model := Model{
-		resources:    resources,
-		resource:     resources[0],
-		connection:   api.ConnectionInfo(),
-		tuiVersion:   tuiVersion,
-		osacVersion:  osacVersion,
-		viewport:     viewport.New(0, 0),
-		commandInput: commandInput,
-		status:       "Loading resources...",
+		resources:      resources,
+		resource:       resources[0],
+		connection:     api.ConnectionInfo(),
+		tuiVersion:     tuiVersion,
+		osacVersion:    osacVersion,
+		viewport:       viewport.New(0, 0),
+		commandInput:   commandInput,
+		resourceSearch: resourceSearch,
+		status:         "Loading resources...",
 	}
+	model.commandInput.SetSuggestions(resourceCompletionSuggestions(resources, ""))
+	model.resourceSearch.SetSuggestions(resourceCompletionSuggestions(resources, ""))
 	model.loading = true
 	return model
 }
@@ -211,6 +221,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = maxInt(message.Width-6, 1)
 		m.viewport.Height = m.bodyHeight()
 		m.commandInput.Width = maxInt(message.Width-8, 1)
+		m.resourceSearch.Width = maxInt(message.Width/3-6, 1)
 		return m, nil
 	case rowsLoadedMsg:
 		m.loading = false
@@ -306,8 +317,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateCommand(message)
 	}
 	if key, ok := message.(tea.KeyMsg); ok && key.String() == ":" {
+		m.resourceMenu = false
+		m.resourceSearch.Blur()
 		m.commandMode = true
 		m.commandInput.Reset()
+		m.commandInput.SetSuggestions(resourceCompletionSuggestions(m.resources, ""))
 		m.commandInput.Focus()
 		m.status = "Command"
 		return m, nil
@@ -338,6 +352,9 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "tab":
 		m.resourceMenu = true
+		m.resourceSearch.Reset()
+		m.resourceSearch.SetSuggestions(resourceCompletionSuggestions(m.resources, ""))
+		m.resourceSearch.Focus()
 		m.resourceIndex = resourceIndex(m.resources, m.resource.Key())
 	case "up", "k":
 		m.selected = clamp(m.selected-1, len(m.rows))
@@ -456,20 +473,53 @@ func (m Model) updateResourceMenu(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch key.String() {
-	case "esc", "tab":
+	case "esc":
 		m.resourceMenu = false
+		m.resourceSearch.Blur()
+	case "tab":
+		if m.resourceSearch.Value() == "" || len(m.resourceSearch.MatchedSuggestions()) == 0 {
+			m.resourceMenu = false
+			m.resourceSearch.Blur()
+			return m, nil
+		}
+		var command tea.Cmd
+		m.resourceSearch, command = m.resourceSearch.Update(message)
+		m.refreshResourceSearch()
+		return m, command
 	case "up", "k":
-		m.resourceIndex = clamp(m.resourceIndex-1, len(m.resources))
+		if key.String() == "up" && len(m.resourceSearch.MatchedSuggestions()) > 0 {
+			var command tea.Cmd
+			m.resourceSearch, command = m.resourceSearch.Update(message)
+			m.refreshResourceSearch()
+			return m, command
+		}
+		m.resourceIndex = clamp(m.resourceIndex-1, len(m.filteredResourceIndexes()))
 	case "down", "j":
-		m.resourceIndex = clamp(m.resourceIndex+1, len(m.resources))
+		if key.String() == "down" && len(m.resourceSearch.MatchedSuggestions()) > 0 {
+			var command tea.Cmd
+			m.resourceSearch, command = m.resourceSearch.Update(message)
+			m.refreshResourceSearch()
+			return m, command
+		}
+		m.resourceIndex = clamp(m.resourceIndex+1, len(m.filteredResourceIndexes()))
 	case "enter":
-		m.resource = m.resources[m.resourceIndex]
+		indexes := m.filteredResourceIndexes()
+		if len(indexes) == 0 {
+			return m, nil
+		}
+		m.resource = m.resources[indexes[clamp(m.resourceIndex, len(indexes))]]
 		m.resourceMenu = false
+		m.resourceSearch.Blur()
 		m.selected = 0
 		m.err = nil
 		m.loading = true
 		m.status = "Loading resources..."
 		return m, m.loadRowsCmd()
+	default:
+		var command tea.Cmd
+		m.resourceSearch, command = m.resourceSearch.Update(message)
+		m.refreshResourceSearch()
+		return m, command
 	}
 	return m, nil
 }
@@ -484,6 +534,9 @@ func (m Model) updateCommand(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			query := strings.TrimSpace(m.commandInput.Value())
+			if suggestion := m.commandInput.CurrentSuggestion(); suggestion != "" {
+				query = suggestion
+			}
 			m.commandMode = false
 			m.commandInput.Blur()
 			return m.selectResource(query)
@@ -491,6 +544,7 @@ func (m Model) updateCommand(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	var command tea.Cmd
 	m.commandInput, command = m.commandInput.Update(message)
+	m.commandInput.SetSuggestions(resourceCompletionSuggestions(m.resources, m.commandInput.Value()))
 	return m, command
 }
 
@@ -499,29 +553,18 @@ func (m Model) selectResource(query string) (tea.Model, tea.Cmd) {
 		m.status = "Resource name is required"
 		return m, nil
 	}
-	normalized := normalizeResourceName(query)
-	var matches []client.Resource
-	for _, resource := range m.resources {
-		key := normalizeResourceName(resource.Key())
-		title := normalizeResourceName(resource.Title())
-		if key == normalized || title == normalized {
-			matches = []client.Resource{resource}
-			break
-		}
-		if strings.HasPrefix(key, normalized) || strings.HasPrefix(title, normalized) {
-			matches = append(matches, resource)
-		}
-	}
-	if len(matches) == 0 {
+	indexes := matchingResourceIndexes(m.resources, query)
+	if len(indexes) == 0 {
 		m.status = "Unknown resource: " + query
 		return m, nil
 	}
-	if len(matches) > 1 {
+	if len(indexes) > 1 {
 		m.status = "Ambiguous resource: " + query
 		return m, nil
 	}
-	m.resource = matches[0]
+	m.resource = m.resources[indexes[0]]
 	m.resourceMenu = false
+	m.resourceSearch.Blur()
 	m.screen = listScreen
 	m.selected = 0
 	m.err = nil
@@ -538,6 +581,101 @@ func normalizeResourceName(value string) string {
 		}
 	}
 	return normalized.String()
+}
+
+func resourceCompletionSuggestions(resources []client.Resource, query string) []string {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		suggestions := make([]string, 0, len(resources))
+		for _, resource := range resources {
+			suggestions = append(suggestions, resource.Key())
+		}
+		return suggestions
+	}
+
+	suggestions := make([]string, 0, len(resources))
+	for _, resource := range resources {
+		key := resource.Key()
+		title := resource.Title()
+		candidate := ""
+		if strings.HasPrefix(strings.ToLower(key), query) {
+			candidate = key
+		} else if strings.HasPrefix(strings.ToLower(title), query) {
+			candidate = title
+		}
+		if candidate != "" {
+			suggestions = append(suggestions, candidate)
+		}
+	}
+	return suggestions
+}
+
+func (m Model) filteredResourceIndexes() []int {
+	return matchingResourceIndexes(m.resources, m.resourceSearch.Value())
+}
+
+func (m *Model) refreshResourceSearch() {
+	m.resourceSearch.SetSuggestions(resourceCompletionSuggestions(m.resources, m.resourceSearch.Value()))
+	indexes := m.filteredResourceIndexes()
+	if len(indexes) == 0 {
+		m.resourceIndex = 0
+		return
+	}
+
+	suggestion := normalizeResourceName(m.resourceSearch.CurrentSuggestion())
+	if suggestion != "" {
+		for position, index := range indexes {
+			resource := m.resources[index]
+			if normalizeResourceName(resource.Key()) == suggestion || normalizeResourceName(resource.Title()) == suggestion {
+				m.resourceIndex = position
+				return
+			}
+		}
+	}
+	m.resourceIndex = clamp(m.resourceIndex, len(indexes))
+}
+
+func matchingResourceIndexes(resources []client.Resource, query string) []int {
+	normalized := normalizeResourceName(query)
+	if normalized == "" {
+		if strings.TrimSpace(query) != "" {
+			return nil
+		}
+		indexes := make([]int, len(resources))
+		for index := range resources {
+			indexes[index] = index
+		}
+		return indexes
+	}
+
+	type match struct {
+		index int
+		rank  int
+	}
+	matches := make([]match, 0, len(resources))
+	for index, resource := range resources {
+		key := normalizeResourceName(resource.Key())
+		title := normalizeResourceName(resource.Title())
+		rank := -1
+		if key == normalized || title == normalized {
+			rank = 0
+		} else if strings.HasPrefix(key, normalized) || strings.HasPrefix(title, normalized) {
+			rank = 1
+		} else if strings.Contains(key, normalized) || strings.Contains(title, normalized) {
+			rank = 2
+		}
+		if rank >= 0 {
+			matches = append(matches, match{index: index, rank: rank})
+		}
+	}
+	sort.SliceStable(matches, func(left, right int) bool {
+		return matches[left].rank < matches[right].rank
+	})
+	indexes := make([]int, len(matches))
+	for index, match := range matches {
+		indexes[index] = match.index
+	}
+	return indexes
 }
 
 func (m Model) View() string {
@@ -687,24 +825,40 @@ func (m Model) listView(width, height int) string {
 }
 
 func (m Model) resourceMenuView(width, height int) string {
-	innerHeight := maxInt(height-4, 1)
-	start, end := visibleRows(m.resourceIndex, len(m.resources), innerHeight)
+	indexes := m.filteredResourceIndexes()
+	innerHeight := maxInt(height-5, 1)
+	start, end := visibleRows(m.resourceIndex, len(indexes), innerHeight)
 	lines := []string{
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("RESOURCE KINDS"),
+		m.resourceSearchView(width),
 	}
-	for index := start; index < end; index++ {
-		resource := m.resources[index]
+	for position := start; position < end; position++ {
+		resource := m.resources[indexes[position]]
 		cursor := "  "
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-		if index == m.resourceIndex {
+		if position == m.resourceIndex {
 			cursor = "> "
 			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
 		}
 		lines = append(lines, style.Render(cursor+truncate(resource.Title(), maxInt(width-6, 1))))
 	}
+	if len(indexes) == 0 {
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("No matching kinds"))
+	}
+	matchCount := fmt.Sprintf("%d/%d kinds", len(indexes), len(m.resources))
 	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
-		fmt.Sprintf("%d kinds  |  j/k move  |  enter select", len(m.resources))))
+		matchCount+"  |  type to search  |  enter select"))
 	return panel(strings.Join(lines, "\n"), width, height, lipgloss.Color("205"))
+}
+
+func (m Model) resourceSearchView(width int) string {
+	search := m.resourceSearch
+	if search.Prompt == "" {
+		search = textinput.New()
+		search.Prompt = "/"
+	}
+	search.Width = maxInt(width-6, 1)
+	return search.View()
 }
 
 func (m Model) detailView() string {
@@ -725,7 +879,7 @@ func (m Model) footerView() string {
 	status := statusStyle.Render(statusText)
 	keyText := "tab kinds  : command  enter view  r refresh  q quit"
 	if m.commandMode {
-		keyText = "enter select  esc cancel"
+		keyText = "up/down cycle  tab complete  enter select  esc cancel"
 	} else if m.resource.Writable() {
 		keyText = "tab kinds  c create  enter view  e edit  d delete  r refresh  q quit"
 	}
