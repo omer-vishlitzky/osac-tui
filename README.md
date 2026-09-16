@@ -63,8 +63,8 @@ on another host port.
 
 | Key | Action |
 | --- | --- |
-| `tab` | Choose a resource kind |
-| `:` | Open resource command mode |
+| `tab` | Search and choose a resource kind; type to filter, arrows to cycle, `enter` to select |
+| `:` | Open resource command mode; type a prefix, `tab` to complete, arrows to cycle |
 | `j`/`k`, arrows | Move through rows or resource kinds |
 | `enter` | Open the selected object |
 | `c` | Create an object with the system editor |
