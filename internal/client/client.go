@@ -6,9 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
+	"time"
 
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,13 +36,27 @@ type Row struct {
 	ID      string
 	Name    string
 	State   string
+	Tenant  string
+	Created time.Time
 	Version string
+}
+
+type ListOptions struct {
+	Offset int
+	Limit  int
+	Filter string
+	Order  string
+}
+
+type ListResult struct {
+	Rows  []Row
+	Total int
 }
 
 type Resource interface {
 	Key() string
 	Title() string
-	List(context.Context) ([]Row, error)
+	List(context.Context, ListOptions) (ListResult, error)
 	Get(context.Context, string) (proto.Message, error)
 	Create(context.Context, proto.Message) (proto.Message, error)
 	Update(context.Context, proto.Message) (proto.Message, error)
@@ -54,6 +71,8 @@ type Client struct {
 	resources map[string]Resource
 	order     []string
 	info      ConnectionInfo
+	transport credentials.TransportCredentials
+	secure    bool
 }
 
 func Dial(ctx context.Context, config Config) (*Client, error) {
@@ -80,8 +99,91 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 		resources: resources,
 		order:     resourceOrder(resources),
 		info:      connectionInfo(config.Address, config.Token),
+		transport: transport,
+		secure:    config.TLSConfig != nil,
 	}, nil
 }
+
+type SerialConsole struct {
+	conn   *grpc.ClientConn
+	stream grpc.BidiStreamingClient[publicv1.ConsoleProxyConnectRequest, publicv1.ConsoleProxyConnectResponse]
+	cancel context.CancelFunc
+}
+
+func (c *Client) OpenSerialConsole(ctx context.Context, resourceType publicv1.ConsoleResourceType, resourceID string) (*SerialConsole, error) {
+	session, err := publicv1.NewConsoleSessionsClient(c.conn).Create(ctx, (&publicv1.ConsoleSessionsCreateRequest_builder{
+		Object: (&publicv1.ConsoleSession_builder{
+			ResourceType: resourceType,
+			ResourceId:   resourceID,
+			Type:         publicv1.ConsoleType_CONSOLE_TYPE_SERIAL,
+			ClientId:     fmt.Sprintf("osac-tui-%d", os.Getpid()),
+		}).Build(),
+	}).Build())
+	if err != nil {
+		return nil, err
+	}
+	if session.GetObject() == nil {
+		return nil, fmt.Errorf("console session response contains no object")
+	}
+	ticket := session.GetObject().GetTicket()
+	if ticket == "" {
+		return nil, fmt.Errorf("console session response contains no ticket")
+	}
+	consoleConn, err := grpc.DialContext(ctx, c.info.Address,
+		grpc.WithTransportCredentials(c.transport),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("connect to console proxy: %w", err)
+	}
+	streamCtx, cancel := context.WithCancel(context.Background())
+	stream, err := publicv1.NewConsoleProxyClient(consoleConn).Connect(streamCtx,
+		grpc.PerRPCCredentials(consoleCredentials{token: ticket, secure: c.secure}),
+	)
+	if err != nil {
+		cancel()
+		_ = consoleConn.Close()
+		return nil, fmt.Errorf("open serial console: %w", err)
+	}
+	return &SerialConsole{conn: consoleConn, stream: stream, cancel: cancel}, nil
+}
+
+func (c *SerialConsole) Send(data []byte) error {
+	return c.stream.Send((&publicv1.ConsoleProxyConnectRequest_builder{
+		Input: (&publicv1.ConsoleInput_builder{Data: data}).Build(),
+	}).Build())
+}
+
+func (c *SerialConsole) Receive() ([]byte, string, error) {
+	response, err := c.stream.Recv()
+	if err != nil {
+		return nil, "", err
+	}
+	if output := response.GetOutput(); output != nil {
+		return output.GetData(), "", nil
+	}
+	if status := response.GetStatus(); status != nil {
+		return nil, status.GetState().String() + ": " + status.GetMessage(), nil
+	}
+	return nil, "", nil
+}
+
+func (c *SerialConsole) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return c.conn.Close()
+}
+
+type consoleCredentials struct {
+	token  string
+	secure bool
+}
+
+func (c consoleCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + c.token}, nil
+}
+
+func (c consoleCredentials) RequireTransportSecurity() bool { return c.secure }
 
 func (c *Client) Close() error {
 	return c.conn.Close()

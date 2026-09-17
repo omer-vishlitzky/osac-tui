@@ -53,4 +53,18 @@ func TestMarshalTemplateIncludesEditableStructure(t *testing.T) {
 	}
 }
 
+func TestRedactSensitiveFields(t *testing.T) {
+	data := RedactSensitive([]byte("metadata:\n  name: demo\n  token: abc\ndata:\n  api_key: encoded\nspec:\n  password: secret\n"))
+	text := string(data)
+	if strings.Contains(text, "abc") || strings.Contains(text, "secret") {
+		t.Fatalf("sensitive values were not redacted:\n%s", text)
+	}
+	if !strings.Contains(text, `token: "REDACTED"`) {
+		t.Fatalf("redacted token missing:\n%s", text)
+	}
+	if !strings.Contains(text, `api_key: "REDACTED"`) {
+		t.Fatalf("redacted data missing:\n%s", text)
+	}
+}
+
 func stringPtr(value string) *string { return &value }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	_ "github.com/osac-project/osac/proto/gen/osac/public/v1"
@@ -22,7 +23,7 @@ type resource struct {
 	key      string
 	title    string
 	writable bool
-	list     func(context.Context) ([]Row, error)
+	list     func(context.Context, ListOptions) (ListResult, error)
 	get      func(context.Context, string) (proto.Message, error)
 	create   func(context.Context, proto.Message) (proto.Message, error)
 	update   func(context.Context, proto.Message) (proto.Message, error)
@@ -37,7 +38,9 @@ func (r resource) Title() string { return r.title }
 
 func (r resource) Writable() bool { return r.writable }
 
-func (r resource) List(ctx context.Context) ([]Row, error) { return r.list(ctx) }
+func (r resource) List(ctx context.Context, options ListOptions) (ListResult, error) {
+	return r.list(ctx, options)
+}
 
 func (r resource) Get(ctx context.Context, id string) (proto.Message, error) {
 	return r.get(ctx, id)
@@ -94,22 +97,38 @@ func newResource(conn *grpc.ClientConn, service protoreflect.ServiceDescriptor) 
 		key:      strings.ToLower(string(service.Name())),
 		title:    resourceTitle(string(service.Name())),
 		writable: writable,
-		list: func(ctx context.Context) ([]Row, error) {
+		list: func(ctx context.Context, options ListOptions) (ListResult, error) {
 			request := dynamicpb.NewMessage(listMethod.Input())
+			if err := setIntField(request, "offset", int64(options.Offset)); err != nil {
+				return ListResult{}, err
+			}
+			if err := setIntField(request, "limit", int64(options.Limit)); err != nil {
+				return ListResult{}, err
+			}
+			if err := setStringFieldIfPresent(request, "filter", options.Filter); err != nil {
+				return ListResult{}, err
+			}
+			if err := setStringFieldIfPresent(request, "order", options.Order); err != nil {
+				return ListResult{}, err
+			}
 			response, err := invokeResourceMethod(ctx, conn, listMethod, request)
 			if err != nil {
-				return nil, err
+				return ListResult{}, err
 			}
 			itemsField := response.ProtoReflect().Descriptor().Fields().ByName("items")
 			if itemsField == nil || itemsField.Cardinality() != protoreflect.Repeated {
-				return nil, fmt.Errorf("resource List response has no items field: %s", service.FullName())
+				return ListResult{}, fmt.Errorf("resource List response has no items field: %s", service.FullName())
 			}
 			items := response.ProtoReflect().Get(itemsField).List()
 			rows := make([]Row, 0, items.Len())
 			for index := 0; index < items.Len(); index++ {
 				rows = append(rows, reflectedRow(items.Get(index).Message().Interface()))
 			}
-			return rows, nil
+			result := ListResult{Rows: rows, Total: len(rows)}
+			if totalField := response.ProtoReflect().Descriptor().Fields().ByName("total"); totalField != nil {
+				result.Total = int(response.ProtoReflect().Get(totalField).Int())
+			}
+			return result, nil
 		},
 		get: func(ctx context.Context, id string) (proto.Message, error) {
 			request := dynamicpb.NewMessage(getMethod.Input())
@@ -198,6 +217,36 @@ func setStringField(message *dynamicpb.Message, name, value string) error {
 	return nil
 }
 
+func setStringFieldIfPresent(message *dynamicpb.Message, name, value string) error {
+	if value == "" {
+		return nil
+	}
+	return setStringField(message, name, value)
+}
+
+func setIntField(message *dynamicpb.Message, name string, value int64) error {
+	if value == 0 {
+		return nil
+	}
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil {
+		return nil
+	}
+	switch field.Kind() {
+	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind:
+		message.Set(field, protoreflect.ValueOfInt32(int32(value)))
+	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
+		message.Set(field, protoreflect.ValueOfInt64(value))
+	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind:
+		message.Set(field, protoreflect.ValueOfUint32(uint32(value)))
+	case protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
+		message.Set(field, protoreflect.ValueOfUint64(uint64(value)))
+	default:
+		return fmt.Errorf("request field %q is not an integer", name)
+	}
+	return nil
+}
+
 func setBoolField(message *dynamicpb.Message, name string, value bool) error {
 	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
 	if field == nil || field.Kind() != protoreflect.BoolKind {
@@ -247,8 +296,35 @@ func reflectedRow(object proto.Message) Row {
 		ID:      stringField(message, "id"),
 		Name:    stringField(metadata, "name"),
 		State:   enumField(status, "state"),
+		Tenant:  stringField(metadata, "tenant"),
+		Created: timestampField(metadata, "creation_timestamp"),
 		Version: versionField(metadata),
 	}
+}
+
+func timestampField(message protoreflect.Message, name string) time.Time {
+	if message == nil {
+		return time.Time{}
+	}
+	field := message.Descriptor().Fields().ByName(protoreflect.Name(name))
+	if field == nil || field.Kind() != protoreflect.MessageKind {
+		return time.Time{}
+	}
+	value := message.Get(field).Message()
+	secondsField := value.Descriptor().Fields().ByName("seconds")
+	if secondsField == nil {
+		return time.Time{}
+	}
+	seconds := value.Get(secondsField).Int()
+	if seconds == 0 {
+		return time.Time{}
+	}
+	nanosField := value.Descriptor().Fields().ByName("nanos")
+	nanos := int64(0)
+	if nanosField != nil {
+		nanos = value.Get(nanosField).Int()
+	}
+	return time.Unix(seconds, nanos).UTC()
 }
 
 func nestedMessage(message protoreflect.Message, name string) protoreflect.Message {
