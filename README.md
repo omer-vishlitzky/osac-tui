@@ -76,6 +76,7 @@ on another host port.
 | `l` | Show related resources and navigate to one |
 | `c` | Create an object with the system editor |
 | `e` | Edit the selected object with the system editor |
+| `y` | Copy the selected object's YAML to the clipboard |
 | `d` | Delete the selected object |
 | `r` | Refresh |
 | `esc` | Go back or cancel |

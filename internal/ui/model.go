@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/bubbletea"
@@ -740,6 +741,20 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			m.status = "Refreshing..."
 			return m, m.loadObjectCmd(m.objectID)
+		case "y":
+			data, err := yamlcodec.Marshal(m.object)
+			if err != nil {
+				m.err = err
+				m.status = "Unable to copy YAML"
+				return m, nil
+			}
+			if err := clipboard.WriteAll(string(data)); err != nil {
+				m.err = err
+				m.status = "Unable to copy YAML"
+				return m, nil
+			}
+			m.err = nil
+			m.status = "YAML copied to clipboard"
 		}
 	}
 	if m.confirmDelete {
@@ -1472,6 +1487,7 @@ func (m Model) helpView() string {
 		"  a                 toggle 1-second auto-refresh",
 		"  c / e / d         create / edit / delete",
 		"  c (detail)        open serial console for instances",
+		"  y (detail)        copy object YAML",
 		"",
 		"Commands",
 		"  :                 open command palette",
