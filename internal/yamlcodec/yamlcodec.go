@@ -120,3 +120,51 @@ func Unmarshal(data []byte, message proto.Message) error {
 	}
 	return nil
 }
+
+// RedactSensitive masks scalar values in fields that commonly contain credentials.
+// The original message remains available for editing; this is only for display.
+func RedactSensitive(data []byte) []byte {
+	lines := strings.Split(string(data), "\n")
+	redactMapIndent := -1
+	for index, line := range lines {
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:colon]))
+		if redactMapIndent >= 0 {
+			if indent <= redactMapIndent {
+				redactMapIndent = -1
+			} else {
+				lines[index] = line[:colon+1] + " \"REDACTED\""
+				continue
+			}
+		}
+		if key == "data" && strings.TrimSpace(line[colon+1:]) == "" {
+			redactMapIndent = indent
+			continue
+		}
+		if !sensitiveField(key) {
+			continue
+		}
+		value := strings.TrimSpace(line[colon+1:])
+		if value != "" && value != "{}" && value != "[]" {
+			lines[index] = line[:colon+1] + " \"REDACTED\""
+		}
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
+func sensitiveField(key string) bool {
+	key = strings.Trim(key, "\"'")
+	if key == "data" || key == "string_data" {
+		return true
+	}
+	for _, part := range []string{"password", "token", "secret", "private_key", "credential"} {
+		if strings.Contains(key, part) {
+			return true
+		}
+	}
+	return false
+}

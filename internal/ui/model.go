@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -15,7 +16,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/osac-project/osac-tui/internal/client"
 	"github.com/osac-project/osac-tui/internal/yamlcodec"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 type screen uint8
@@ -23,11 +26,26 @@ type screen uint8
 const (
 	listScreen screen = iota
 	detailScreen
+	consoleScreen
 )
 
 type rowsLoadedMsg struct {
-	rows []client.Row
-	err  error
+	rows  []client.Row
+	total int
+	err   error
+}
+
+type autoRefreshMsg struct{}
+
+type consoleOpenedMsg struct {
+	console *client.SerialConsole
+	err     error
+}
+
+type consoleOutputMsg struct {
+	data   []byte
+	status string
+	err    error
 }
 
 type objectLoadedMsg struct {
@@ -44,9 +62,21 @@ type mutationFinishedMsg struct {
 
 type deleteFinishedMsg struct{ err error }
 
+type bulkDeleteFinishedMsg struct {
+	deleted int
+	err     error
+}
+
 type editorFinishedMsg struct {
-	data []byte
-	err  error
+	data      []byte
+	unchanged bool
+	err       error
+}
+
+type relatedReference struct {
+	label    string
+	resource client.Resource
+	id       string
 }
 
 var actionVerbs = map[string]string{
@@ -60,33 +90,54 @@ var actionProgress = map[string]string{
 }
 
 type Model struct {
+	api         *client.Client
 	resource    client.Resource
 	resources   []client.Resource
 	connection  client.ConnectionInfo
 	tuiVersion  string
 	osacVersion string
 	rows        []client.Row
+	total       int
 	selected    int
+	selectedIDs map[string]bool
+	page        int
+	pageSize    int
+	filter      string
+	sortField   string
+	sortDesc    bool
 
 	screen        screen
 	resourceMenu  bool
 	resourceIndex int
 	confirmDelete bool
+	bulkDelete    bool
 	loading       bool
+	autoRefresh   bool
 
-	object   proto.Message
-	objectID string
-	action   string
+	object       proto.Message
+	objectID     string
+	action       string
+	originalData []byte
+	pendingData  []byte
+	diffMode     bool
 
-	viewport       viewport.Model
-	commandInput   textinput.Model
-	resourceSearch textinput.Model
-	commandMode    bool
-	width          int
-	height         int
-	status         string
-	err            error
-	errorDialog    bool
+	viewport         viewport.Model
+	commandInput     textinput.Model
+	resourceSearch   textinput.Model
+	filterInput      textinput.Model
+	commandMode      bool
+	filterMode       bool
+	helpMode         bool
+	relationshipMode bool
+	references       []relatedReference
+	referenceIndex   int
+	console          *client.SerialConsole
+	consoleText      string
+	width            int
+	height           int
+	status           string
+	err              error
+	errorDialog      bool
 }
 
 func New(api *client.Client, tuiVersion, osacVersion string) Model {
@@ -99,7 +150,11 @@ func New(api *client.Client, tuiVersion, osacVersion string) Model {
 	resourceSearch.Prompt = "/"
 	resourceSearch.CharLimit = 64
 	resourceSearch.ShowSuggestions = true
+	filterInput := textinput.New()
+	filterInput.Prompt = "/"
+	filterInput.CharLimit = 256
 	model := Model{
+		api:            api,
 		resources:      resources,
 		resource:       resources[0],
 		connection:     api.ConnectionInfo(),
@@ -108,6 +163,11 @@ func New(api *client.Client, tuiVersion, osacVersion string) Model {
 		viewport:       viewport.New(0, 0),
 		commandInput:   commandInput,
 		resourceSearch: resourceSearch,
+		filterInput:    filterInput,
+		selectedIDs:    make(map[string]bool),
+		pageSize:       50,
+		sortField:      "metadata.name",
+		autoRefresh:    true,
 		status:         "Loading resources...",
 	}
 	model.commandInput.SetSuggestions(resourceCompletionSuggestions(resources, ""))
@@ -116,15 +176,60 @@ func New(api *client.Client, tuiVersion, osacVersion string) Model {
 	return model
 }
 
-func (m Model) Init() tea.Cmd { return m.loadRowsCmd() }
+func (m Model) Init() tea.Cmd { return tea.Batch(m.loadRowsCmd(), m.autoRefreshCmd()) }
+
+func (m Model) autoRefreshCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return autoRefreshMsg{} })
+}
 
 func (m Model) loadRowsCmd() tea.Cmd {
 	resource := m.resource
+	options := client.ListOptions{
+		Offset: 0,
+		Limit:  0,
+	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		rows, err := resource.List(ctx)
-		return rowsLoadedMsg{rows: rows, err: err}
+		result, err := resource.List(ctx, options)
+		return rowsLoadedMsg{rows: result.Rows, total: result.Total, err: err}
+	}
+}
+
+func (m Model) openSerialConsoleCmd() tea.Cmd {
+	resourceType, ok := serialConsoleResourceType(m.resource.Key())
+	if !ok || m.api == nil {
+		return nil
+	}
+	resourceID := m.objectID
+	api := m.api
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		console, err := api.OpenSerialConsole(ctx, resourceType, resourceID)
+		return consoleOpenedMsg{console: console, err: err}
+	}
+}
+
+func (m Model) receiveConsoleCmd() tea.Cmd {
+	console := m.console
+	if console == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		data, status, err := console.Receive()
+		return consoleOutputMsg{data: data, status: status, err: err}
+	}
+}
+
+func serialConsoleResourceType(key string) (publicv1.ConsoleResourceType, bool) {
+	switch key {
+	case "computeinstances":
+		return publicv1.ConsoleResourceType_CONSOLE_RESOURCE_TYPE_COMPUTE_INSTANCE, true
+	case "baremetalinstances":
+		return publicv1.ConsoleResourceType_CONSOLE_RESOURCE_TYPE_HOST, true
+	default:
+		return publicv1.ConsoleResourceType_CONSOLE_RESOURCE_TYPE_UNSPECIFIED, false
 	}
 }
 
@@ -176,6 +281,7 @@ func (m Model) deleteCmd(id string) tea.Cmd {
 }
 
 func (m Model) editCmd(data []byte) (tea.Cmd, error) {
+	originalData := append([]byte(nil), data...)
 	file, err := os.CreateTemp("", "osac-tui-*.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("create editor file: %w", err)
@@ -209,12 +315,55 @@ func (m Model) editCmd(data []byte) (tea.Cmd, error) {
 		if readErr != nil {
 			return editorFinishedMsg{err: fmt.Errorf("read editor file: %w", readErr)}
 		}
-		return editorFinishedMsg{data: data}
+		return editorFinishedMsg{data: data, unchanged: bytes.Equal(data, originalData)}
 	}), nil
 }
 
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
+	case autoRefreshMsg:
+		if !m.autoRefresh || m.loading || m.diffMode || m.filterMode || m.commandMode || m.screen == consoleScreen {
+			if m.autoRefresh {
+				return m, m.autoRefreshCmd()
+			}
+			return m, nil
+		}
+		m.loading = true
+		m.status = "Auto-refreshing..."
+		return m, tea.Batch(m.loadRowsCmd(), m.autoRefreshCmd())
+	case consoleOpenedMsg:
+		if message.err != nil {
+			m.err = message.err
+			m.errorDialog = true
+			m.status = "Unable to open serial console"
+			return m, nil
+		}
+		m.console = message.console
+		m.consoleText = ""
+		m.screen = consoleScreen
+		m.status = "Serial console connected; esc closes"
+		return m, m.receiveConsoleCmd()
+	case consoleOutputMsg:
+		if message.err != nil {
+			m.status = "Serial console disconnected: " + message.err.Error()
+			if m.console != nil {
+				_ = m.console.Close()
+			}
+			m.console = nil
+			return m, nil
+		}
+		if message.status != "" {
+			m.status = message.status
+		}
+		m.consoleText += string(message.data)
+		m.viewport.SetContent(m.consoleText)
+		m.viewport.GotoBottom()
+		return m, m.receiveConsoleCmd()
+	case consoleInputMsg:
+		if message.err != nil {
+			m.status = "Console input failed: " + message.err.Error()
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 		m.height = message.Height
@@ -222,10 +371,21 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = m.bodyHeight()
 		m.commandInput.Width = maxInt(message.Width-8, 1)
 		m.resourceSearch.Width = maxInt(message.Width/3-6, 1)
+		m.filterInput.Width = maxInt(message.Width-8, 1)
 		return m, nil
 	case rowsLoadedMsg:
 		m.loading = false
-		m.rows = message.rows
+		rows := message.rows
+		if query := strings.TrimSpace(m.filter); query != "" {
+			rows = fuzzyRows(rows, query)
+			m.total = len(rows)
+		} else {
+			m.total = message.total
+		}
+		sortRows(rows, m.sortField, m.sortDesc)
+		start := minInt(m.page*m.effectivePageSize(), len(rows))
+		end := minInt(start+m.effectivePageSize(), len(rows))
+		m.rows = rows[start:end]
 		m.selected = clamp(m.selected, len(m.rows))
 		m.err = message.err
 		if message.err != nil {
@@ -233,7 +393,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = nil
-		m.status = fmt.Sprintf("%d %s", len(m.rows), m.resource.Title())
+		m.status = fmt.Sprintf("%d/%d %s", len(m.rows), m.total, m.resource.Title())
 		return m, nil
 	case objectLoadedMsg:
 		m.loading = false
@@ -245,7 +405,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.object = message.object
-		m.viewport.SetContent(string(message.data))
+		m.viewport.SetContent(string(yamlcodec.RedactSensitive(message.data)))
 		m.viewport.GotoTop()
 		m.screen = detailScreen
 		m.status = "Read-only view"
@@ -254,14 +414,22 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		if message.err != nil {
-			m.errorDialog = true
-			m.status = "Unable to save object"
-			return m, nil
+			data := rejectedEditorData(m.pendingData, message.err)
+			command, err := m.editCmd(data)
+			if err != nil {
+				m.err = err
+				m.errorDialog = true
+				m.status = "Editor failed"
+				return m, nil
+			}
+			m.err = message.err
+			m.status = "Save rejected; edit and resubmit"
+			return m, command
 		}
 		m.err = nil
 		m.object = message.object
 		m.objectID = m.resource.Row(message.object).ID
-		m.viewport.SetContent(string(message.data))
+		m.viewport.SetContent(string(yamlcodec.RedactSensitive(message.data)))
 		m.viewport.GotoTop()
 		m.screen = detailScreen
 		m.status = actionVerbs[m.action] + " completed"
@@ -279,22 +447,56 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = listScreen
 		m.status = "Delete completed"
 		return m, m.loadRowsCmd()
-	case editorFinishedMsg:
+	case bulkDeleteFinishedMsg:
+		m.loading = false
+		m.bulkDelete = false
+		m.selectedIDs = make(map[string]bool)
 		if message.err != nil {
 			m.err = message.err
 			m.errorDialog = true
-			m.status = "Editor failed"
+			m.status = fmt.Sprintf("Deleted %d objects; some deletions failed", message.deleted)
+			return m, nil
+		}
+		m.err = nil
+		m.status = fmt.Sprintf("Deleted %d objects", message.deleted)
+		return m, m.loadRowsCmd()
+	case editorFinishedMsg:
+		if message.err != nil {
+			m.err = nil
+			m.errorDialog = false
+			m.pendingData = nil
+			m.diffMode = false
+			m.status = "Editor canceled"
+			return m, nil
+		}
+		if message.unchanged {
+			m.pendingData = nil
+			m.diffMode = false
+			m.status = "Editor canceled; no changes saved"
 			return m, nil
 		}
 		m.err = nil
 		object := m.resource.New()
 		if err := yamlcodec.Unmarshal(message.data, object); err != nil {
+			data := rejectedEditorData(message.data, err)
+			command, editorErr := m.editCmd(data)
+			if editorErr != nil {
+				m.err = editorErr
+				m.errorDialog = true
+				m.status = "Editor failed"
+				return m, nil
+			}
 			m.err = err
-			m.errorDialog = true
-			m.status = "Invalid YAML"
-			return m, nil
+			m.status = "Invalid YAML; edit and resubmit"
+			return m, command
 		}
 		m.object = object
+		m.pendingData = append([]byte(nil), message.data...)
+		if m.action == "update" && string(m.originalData) != string(message.data) {
+			m.diffMode = true
+			m.status = "Review changes [y/n]"
+			return m, nil
+		}
 		m.loading = true
 		m.status = actionProgress[m.action]
 		return m, m.mutationCmd(object)
@@ -313,15 +515,37 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.helpMode {
+		return m.updateHelp(message)
+	}
+	if m.relationshipMode {
+		return m.updateRelationships(message)
+	}
+	if m.screen == consoleScreen {
+		return m.updateConsole(message)
+	}
+	if m.bulkDelete {
+		return m.updateBulkDelete(message)
+	}
+	if m.diffMode {
+		return m.updateDiff(message)
+	}
 	if m.commandMode {
 		return m.updateCommand(message)
+	}
+	if m.filterMode {
+		return m.updateFilter(message)
+	}
+	if key, ok := message.(tea.KeyMsg); ok && key.String() == "?" {
+		m.helpMode = true
+		return m, nil
 	}
 	if key, ok := message.(tea.KeyMsg); ok && key.String() == ":" {
 		m.resourceMenu = false
 		m.resourceSearch.Blur()
 		m.commandMode = true
 		m.commandInput.Reset()
-		m.commandInput.SetSuggestions(resourceCompletionSuggestions(m.resources, ""))
+		m.commandInput.SetSuggestions(commandSuggestions(m.resources, ""))
 		m.commandInput.Focus()
 		m.status = "Command"
 		return m, nil
@@ -350,6 +574,9 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
+	case "?":
+		m.helpMode = true
+		return m, nil
 	case "tab":
 		m.resourceMenu = true
 		m.resourceSearch.Reset()
@@ -360,6 +587,26 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.selected = clamp(m.selected-1, len(m.rows))
 	case "down", "j":
 		m.selected = clamp(m.selected+1, len(m.rows))
+	case " ":
+		if len(m.rows) > 0 && m.rows[m.selected].ID != "" {
+			if m.selectedIDs == nil {
+				m.selectedIDs = make(map[string]bool)
+			}
+			id := m.rows[m.selected].ID
+			m.selectedIDs[id] = !m.selectedIDs[id]
+			m.selected = clamp(m.selected+1, len(m.rows))
+		}
+	case "d":
+		if !m.resource.Writable() {
+			m.status = "Resource is read-only"
+			return m, nil
+		}
+		if len(selectedIDList(m.selectedIDs)) == 0 {
+			m.status = "Select objects with space first"
+			return m, nil
+		}
+		m.bulkDelete = true
+		m.status = "Confirm bulk delete"
 	case "enter":
 		if len(m.rows) == 0 {
 			return m, nil
@@ -374,6 +621,40 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.status = "Refreshing..."
 		return m, m.loadRowsCmd()
+	case "a":
+		m.autoRefresh = !m.autoRefresh
+		if m.autoRefresh {
+			m.status = "Auto-refresh enabled (1s)"
+			return m, m.autoRefreshCmd()
+		}
+		m.status = "Auto-refresh disabled"
+	case "/":
+		m.filterMode = true
+		m.filterInput.SetValue(m.filter)
+		m.filterInput.CursorEnd()
+		m.filterInput.Focus()
+		m.status = "Filter"
+	case "s":
+		m.nextSort()
+		m.loading = true
+		m.status = "Sorting..."
+		return m, m.loadRowsCmd()
+	case "n":
+		if m.hasNextPage() {
+			m.page++
+			m.selected = 0
+			m.loading = true
+			m.status = "Loading next page..."
+			return m, m.loadRowsCmd()
+		}
+	case "p":
+		if m.page > 0 {
+			m.page--
+			m.selected = 0
+			m.loading = true
+			m.status = "Loading previous page..."
+			return m, m.loadRowsCmd()
+		}
 	case "c":
 		if !m.resource.Writable() {
 			m.status = "Resource is read-only"
@@ -381,6 +662,7 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.action = "create"
+		m.originalData = nil
 		m.object = m.resource.New()
 		data, err := yamlcodec.MarshalTemplate(m.object)
 		if err != nil {
@@ -408,7 +690,7 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "esc", "backspace":
 			m.screen = listScreen
-			m.status = fmt.Sprintf("%d %s", len(m.rows), m.resource.Title())
+			m.status = fmt.Sprintf("%d/%d %s", len(m.rows), m.total, m.resource.Title())
 		case "e":
 			if !m.resource.Writable() {
 				m.status = "Resource is read-only"
@@ -421,6 +703,7 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.action = "update"
+			m.originalData = append([]byte(nil), data...)
 			command, err := m.editCmd(data)
 			if err != nil {
 				m.err = err
@@ -430,6 +713,22 @@ func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.status = "Opening editor..."
 			return m, command
+		case "c":
+			if _, ok := serialConsoleResourceType(m.resource.Key()); !ok {
+				m.status = "Serial console is not supported for this resource"
+				return m, nil
+			}
+			m.status = "Opening serial console..."
+			return m, m.openSerialConsoleCmd()
+		case "l":
+			m.references = findRelatedReferences(m.object, m.resources)
+			if len(m.references) == 0 {
+				m.status = "No related resources found"
+				return m, nil
+			}
+			m.relationshipMode = true
+			m.referenceIndex = 0
+			return m, nil
 		case "d":
 			if !m.resource.Writable() {
 				m.status = "Resource is read-only"
@@ -511,6 +810,10 @@ func (m Model) updateResourceMenu(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.resourceMenu = false
 		m.resourceSearch.Blur()
 		m.selected = 0
+		m.page = 0
+		m.filter = ""
+		m.filterInput.Reset()
+		m.selectedIDs = make(map[string]bool)
 		m.err = nil
 		m.loading = true
 		m.status = "Loading resources..."
@@ -530,7 +833,7 @@ func (m Model) updateCommand(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.commandMode = false
 			m.commandInput.Blur()
-			m.status = fmt.Sprintf("%d %s", len(m.rows), m.resource.Title())
+			m.status = fmt.Sprintf("%d/%d %s", len(m.rows), m.total, m.resource.Title())
 			return m, nil
 		case "enter":
 			query := strings.TrimSpace(m.commandInput.Value())
@@ -539,14 +842,429 @@ func (m Model) updateCommand(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.commandMode = false
 			m.commandInput.Blur()
+			if updated, command, handled := m.executeCommand(query); handled {
+				return updated, command
+			}
 			return m.selectResource(query)
 		}
 	}
 	var command tea.Cmd
 	m.commandInput, command = m.commandInput.Update(message)
-	m.commandInput.SetSuggestions(resourceCompletionSuggestions(m.resources, m.commandInput.Value()))
+	m.commandInput.SetSuggestions(commandSuggestions(m.resources, m.commandInput.Value()))
 	return m, command
 }
+
+func (m Model) executeCommand(query string) (tea.Model, tea.Cmd, bool) {
+	switch strings.ToLower(strings.TrimSpace(query)) {
+	case "help":
+		m.helpMode = true
+		return m, nil, true
+	case "filter":
+		m.filterMode = true
+		m.filterInput.SetValue(m.filter)
+		m.filterInput.CursorEnd()
+		m.filterInput.Focus()
+		m.status = "Filter"
+		return m, nil, true
+	case "sort":
+		m.nextSort()
+		m.loading = true
+		m.status = "Sorting..."
+		return m, m.loadRowsCmd(), true
+	case "refresh":
+		m.loading = true
+		m.status = "Refreshing..."
+		return m, m.loadRowsCmd(), true
+	case "next":
+		if m.hasNextPage() {
+			m.page++
+			m.selected = 0
+			m.loading = true
+			m.status = "Loading next page..."
+			return m, m.loadRowsCmd(), true
+		}
+		return m, nil, true
+	case "previous":
+		if m.page > 0 {
+			m.page--
+			m.selected = 0
+			m.loading = true
+			m.status = "Loading previous page..."
+			return m, m.loadRowsCmd(), true
+		}
+		return m, nil, true
+	case "quit":
+		return m, tea.Quit, true
+	default:
+		return m, nil, false
+	}
+}
+
+func (m Model) updateHelp(message tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := message.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "?", "esc", "q":
+			m.helpMode = false
+		}
+	}
+	return m, nil
+}
+
+func (m Model) updateRelationships(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch key.String() {
+	case "esc", "l":
+		m.relationshipMode = false
+	case "up", "k":
+		m.referenceIndex = clamp(m.referenceIndex-1, len(m.references))
+	case "down", "j":
+		m.referenceIndex = clamp(m.referenceIndex+1, len(m.references))
+	case "enter":
+		if len(m.references) == 0 {
+			return m, nil
+		}
+		reference := m.references[m.referenceIndex]
+		m.resource = reference.resource
+		m.objectID = reference.id
+		m.relationshipMode = false
+		m.loading = true
+		m.status = "Loading related object..."
+		return m, m.loadObjectCmd(reference.id)
+	}
+	return m, nil
+}
+
+func (m Model) updateConsole(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyMsg)
+	if !ok || m.console == nil {
+		return m, nil
+	}
+	if key.String() == "esc" || key.String() == "ctrl+c" {
+		_ = m.console.Close()
+		m.console = nil
+		m.screen = detailScreen
+		m.status = "Serial console closed"
+		return m, nil
+	}
+	data := consoleKeyBytes(key)
+	if len(data) == 0 {
+		return m, nil
+	}
+	console := m.console
+	return m, func() tea.Msg {
+		return consoleInputMsg{err: console.Send(data)}
+	}
+}
+
+func (m Model) updateBulkDelete(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch key.String() {
+	case "y":
+		ids := selectedIDList(m.selectedIDs)
+		m.loading = true
+		m.status = fmt.Sprintf("Deleting %d objects...", len(ids))
+		return m, m.bulkDeleteCmd(ids)
+	case "n", "esc":
+		m.bulkDelete = false
+		m.status = "Bulk delete canceled"
+	}
+	return m, nil
+}
+
+func (m Model) bulkDeleteCmd(ids []string) tea.Cmd {
+	resource := m.resource
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		deleted := 0
+		var failures []string
+		for _, id := range ids {
+			if err := resource.Delete(ctx, id); err != nil {
+				failures = append(failures, id+": "+err.Error())
+				continue
+			}
+			deleted++
+		}
+		if len(failures) > 0 {
+			return bulkDeleteFinishedMsg{deleted: deleted, err: fmt.Errorf("%s", strings.Join(failures, "; "))}
+		}
+		return bulkDeleteFinishedMsg{deleted: deleted}
+	}
+}
+
+func selectedIDs(rows []client.Row, selected map[string]bool) []string {
+	ids := make([]string, 0, len(selected))
+	for _, row := range rows {
+		if selected[row.ID] {
+			ids = append(ids, row.ID)
+		}
+	}
+	return ids
+}
+
+func selectedIDList(selected map[string]bool) []string {
+	ids := make([]string, 0, len(selected))
+	for id, isSelected := range selected {
+		if isSelected {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+type consoleInputMsg struct{ err error }
+
+func consoleKeyBytes(key tea.KeyMsg) []byte {
+	if len(key.Runes) > 0 {
+		return []byte(string(key.Runes))
+	}
+	switch key.String() {
+	case "enter":
+		return []byte("\r")
+	case "backspace":
+		return []byte("\x7f")
+	case "tab":
+		return []byte("\t")
+	case "up":
+		return []byte("\x1b[A")
+	case "down":
+		return []byte("\x1b[B")
+	case "right":
+		return []byte("\x1b[C")
+	case "left":
+		return []byte("\x1b[D")
+	case "ctrl+d":
+		return []byte("\x04")
+	case "ctrl+l":
+		return []byte("\x0c")
+	default:
+		return nil
+	}
+}
+
+func findRelatedReferences(object proto.Message, resources []client.Resource) []relatedReference {
+	if object == nil {
+		return nil
+	}
+	var result []relatedReference
+	var walk func(protoreflect.Message, string, int)
+	walk = func(message protoreflect.Message, path string, depth int) {
+		if message == nil || depth > 3 {
+			return
+		}
+		fields := message.Descriptor().Fields()
+		for index := 0; index < fields.Len(); index++ {
+			field := fields.Get(index)
+			name := string(field.Name())
+			if field.Kind() == protoreflect.StringKind && strings.HasSuffix(name, "_id") {
+				id := message.Get(field).String()
+				if id == "" {
+					continue
+				}
+				if resource, ok := relatedResource(resources, strings.TrimSuffix(name, "_id")); ok {
+					label := name
+					if path != "" {
+						label = path + "." + name
+					}
+					result = append(result, relatedReference{label: label, resource: resource, id: id})
+				}
+				continue
+			}
+			if field.Kind() == protoreflect.MessageKind && field.Cardinality() != protoreflect.Repeated && message.Has(field) {
+				childPath := name
+				if path != "" {
+					childPath = path + "." + name
+				}
+				walk(message.Get(field).Message(), childPath, depth+1)
+			}
+		}
+	}
+	walk(object.ProtoReflect(), "", 0)
+	return result
+}
+
+func relatedResource(resources []client.Resource, name string) (client.Resource, bool) {
+	wanted := normalizeResourceName(name)
+	for _, resource := range resources {
+		key := normalizeResourceName(resource.Key())
+		if key == wanted || strings.TrimSuffix(key, "s") == wanted {
+			return resource, true
+		}
+	}
+	return nil, false
+}
+
+func commandSuggestions(resources []client.Resource, query string) []string {
+	commands := []string{"help", "filter", "sort", "refresh", "next", "previous", "quit"}
+	suggestions := resourceCompletionSuggestions(resources, query)
+	query = strings.ToLower(strings.TrimSpace(query))
+	for _, command := range commands {
+		if query == "" || strings.HasPrefix(command, query) {
+			suggestions = append(suggestions, command)
+		}
+	}
+	return suggestions
+}
+
+func (m Model) updateFilter(message tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := message.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "esc":
+			wasFiltered := strings.TrimSpace(m.filter) != ""
+			m.filter = ""
+			m.filterInput.Reset()
+			m.filterMode = false
+			m.filterInput.Blur()
+			m.screen = listScreen
+			m.page = 0
+			m.selected = 0
+			if wasFiltered {
+				m.loading = true
+				m.status = "Clearing filter..."
+				return m, m.loadRowsCmd()
+			}
+			return m, nil
+		case "enter":
+			m.filter = strings.TrimSpace(m.filterInput.Value())
+			m.filterMode = false
+			m.filterInput.Blur()
+			m.page = 0
+			m.selected = 0
+			m.loading = true
+			m.status = "Applying filter..."
+			return m, m.loadRowsCmd()
+		}
+	}
+	var command tea.Cmd
+	m.filterInput, command = m.filterInput.Update(message)
+	return m, command
+}
+
+func (m Model) updateDiff(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch key.String() {
+	case "y", "enter":
+		m.diffMode = false
+		m.loading = true
+		m.status = actionProgress[m.action]
+		return m, m.mutationCmd(m.object)
+	case "n", "esc":
+		m.diffMode = false
+		m.status = "Changes discarded"
+		return m, nil
+	}
+	return m, nil
+}
+
+func rejectedEditorData(data []byte, err error) []byte {
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	comment := strings.Split(err.Error(), "\n")
+	prefix := make([]string, 0, len(comment)+1)
+	for _, line := range comment {
+		prefix = append(prefix, "# Save rejected: "+line)
+	}
+	prefix = append(prefix, "# Edit the document and save again.")
+	return []byte(strings.Join(append(prefix, lines...), "\n") + "\n")
+}
+
+func (m Model) sortOrder() string {
+	if m.sortField == "" {
+		return ""
+	}
+	order := m.sortField
+	if m.sortDesc {
+		order += " desc"
+	}
+	return order
+}
+
+func (m *Model) nextSort() {
+	fields := []string{"metadata.name", "status.state", "metadata.tenant", "metadata.creation_timestamp"}
+	for index, field := range fields {
+		if m.sortField != field {
+			continue
+		}
+		if !m.sortDesc {
+			m.sortDesc = true
+		} else {
+			m.sortField = fields[(index+1)%len(fields)]
+			m.sortDesc = false
+		}
+		return
+	}
+	m.sortField = fields[0]
+	m.sortDesc = false
+}
+
+func (m Model) hasNextPage() bool {
+	return (m.page+1)*m.effectivePageSize() < m.total
+}
+
+func fuzzyRows(rows []client.Row, query string) []client.Row {
+	filtered := make([]client.Row, 0, len(rows))
+	query = strings.ToLower(strings.TrimSpace(query))
+	for _, row := range rows {
+		candidate := strings.ToLower(strings.Join([]string{row.Name, row.ID, row.Tenant, row.State}, " "))
+		if fuzzyMatch(candidate, query) {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered
+}
+
+func fuzzyMatch(value, query string) bool {
+	if query == "" {
+		return true
+	}
+	queryRunes := []rune(query)
+	valueRunes := []rune(value)
+	queryIndex := 0
+	for _, character := range valueRunes {
+		if character == queryRunes[queryIndex] {
+			queryIndex++
+			if queryIndex == len(queryRunes) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sortRows(rows []client.Row, field string, descending bool) {
+	sort.SliceStable(rows, func(left, right int) bool {
+		leftValue := rowSortValue(rows[left], field)
+		rightValue := rowSortValue(rows[right], field)
+		if descending {
+			return leftValue > rightValue
+		}
+		return leftValue < rightValue
+	})
+}
+
+func rowSortValue(row client.Row, field string) string {
+	switch field {
+	case "status.state":
+		return row.State
+	case "metadata.tenant":
+		return row.Tenant
+	case "metadata.creation_timestamp":
+		return row.Created.Format(time.RFC3339Nano)
+	default:
+		return row.Name
+	}
+}
+
+func (m Model) effectivePageSize() int { return maxInt(m.pageSize, 50) }
 
 func (m Model) selectResource(query string) (tea.Model, tea.Cmd) {
 	if query == "" {
@@ -567,6 +1285,10 @@ func (m Model) selectResource(query string) (tea.Model, tea.Cmd) {
 	m.resourceSearch.Blur()
 	m.screen = listScreen
 	m.selected = 0
+	m.page = 0
+	m.filter = ""
+	m.filterInput.Reset()
+	m.selectedIDs = make(map[string]bool)
 	m.err = nil
 	m.loading = true
 	m.status = "Loading resources..."
@@ -687,11 +1409,25 @@ func (m Model) View() string {
 	if m.errorDialog {
 		return m.errorView()
 	}
+	if m.helpMode {
+		return m.helpView()
+	}
+	if m.relationshipMode {
+		return m.relationshipView()
+	}
+	if m.bulkDelete {
+		return m.bulkDeleteView()
+	}
+	if m.diffMode {
+		return m.diffView()
+	}
 	switch m.screen {
 	case listScreen:
 		return m.listPage()
 	case detailScreen:
 		return m.detailPage()
+	case consoleScreen:
+		return m.consolePage()
 	}
 	panic("unknown screen")
 }
@@ -716,10 +1452,131 @@ func (m Model) errorView() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
 }
 
+func (m Model) helpView() string {
+	content := strings.Join([]string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("OSAC TUI HELP"),
+		"",
+		"Navigation",
+		"  j/k or arrows     move through rows",
+		"  enter             open selected object",
+		"  space             select a row",
+		"  d                 delete selected rows",
+		"  l                 show related resources",
+		"  tab               choose resource kind",
+		"  n / p             next / previous page",
+		"",
+		"List actions",
+		"  /                 fuzzy filter",
+		"  s                 cycle sort field and direction",
+		"  r                 refresh",
+		"  a                 toggle 1-second auto-refresh",
+		"  c / e / d         create / edit / delete",
+		"  c (detail)        open serial console for instances",
+		"",
+		"Commands",
+		"  :                 open command palette",
+		"  :filter           edit fuzzy filter",
+		"  :sort             change sort",
+		"  :refresh          reload resources",
+		"",
+		"? / esc             close help",
+	}, "\n")
+	width := minInt(maxInt(m.width-4, 1), 76)
+	dialog := lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(1, 2).
+		Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+func (m Model) relationshipView() string {
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("RELATED RESOURCES"),
+		"",
+	}
+	for index, reference := range m.references {
+		cursor := "  "
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		if index == m.referenceIndex {
+			cursor = "> "
+			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%-24s %s/%s", cursor, reference.label, reference.resource.Title(), reference.id)))
+	}
+	lines = append(lines, "", "up/down select  enter open  esc close")
+	dialog := lipgloss.NewStyle().
+		Width(minInt(maxInt(m.width-4, 1), 100)).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(1, 2).
+		Render(strings.Join(lines, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+func (m Model) bulkDeleteView() string {
+	count := len(selectedIDList(m.selectedIDs))
+	body := fmt.Sprintf("Delete %d selected objects?\n\n[y] delete  [n/esc] cancel", count)
+	dialog := lipgloss.NewStyle().
+		Width(minInt(maxInt(m.width-4, 1), 60)).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("204")).
+		Padding(1, 2).
+		Render(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("204")).Render("BULK DELETE") + "\n\n" + body)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+func (m Model) diffView() string {
+	content := strings.Join([]string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("REVIEW CHANGES"),
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Render(yamlDiff(m.originalData, m.pendingData)),
+		"",
+		"submit changes? [y/N]",
+	}, "\n")
+	dialog := lipgloss.NewStyle().
+		Width(minInt(maxInt(m.width-4, 1), 110)).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(1, 2).
+		Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+func yamlDiff(before, after []byte) string {
+	oldLines := strings.Split(strings.TrimSuffix(string(before), "\n"), "\n")
+	newLines := strings.Split(strings.TrimSuffix(string(after), "\n"), "\n")
+	lines := []string{"--- current", "+++ submitted"}
+	prefix := 0
+	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(oldLines)-prefix && suffix < len(newLines)-prefix &&
+		oldLines[len(oldLines)-1-suffix] == newLines[len(newLines)-1-suffix] {
+		suffix++
+	}
+	for _, line := range oldLines[prefix : len(oldLines)-suffix] {
+		if line != "" {
+			lines = append(lines, "-"+line)
+		}
+	}
+	for _, line := range newLines[prefix : len(newLines)-suffix] {
+		if line != "" {
+			lines = append(lines, "+"+line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m Model) listPage() string {
 	sections := []string{m.headerView(), m.bodyView()}
 	if m.commandMode {
 		sections = append(sections, m.commandView())
+	}
+	if m.filterMode {
+		sections = append(sections, m.filterView())
 	}
 	footer := m.footerView()
 	sections = append(sections, footer)
@@ -731,8 +1588,17 @@ func (m Model) detailPage() string {
 	if m.commandMode {
 		sections = append(sections, m.commandView())
 	}
+	if m.filterMode {
+		sections = append(sections, m.filterView())
+	}
 	sections = append(sections, m.footerView())
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m Model) consolePage() string {
+	return lipgloss.JoinVertical(lipgloss.Left, m.headerView(),
+		panel(m.viewport.View(), m.width, m.bodyHeight(), lipgloss.Color("205")),
+		m.footerView())
 }
 
 func (m Model) headerView() string {
@@ -766,6 +1632,14 @@ func (m Model) commandView() string {
 		Render(m.commandInput.View())
 }
 
+func (m Model) filterView() string {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(0, 1).
+		Render(m.filterInput.View())
+}
+
 func (m Model) bodyView() string {
 	if !m.resourceMenu {
 		return m.listView(m.width, m.bodyHeight())
@@ -787,13 +1661,21 @@ func (m Model) bodyHeight() int {
 	if m.commandMode {
 		overhead += 3
 	}
+	if m.filterMode {
+		overhead += 3
+	}
 	return maxInt(m.height-overhead, 1)
 }
 
 func (m Model) listView(width, height int) string {
 	innerWidth := maxInt(width-4, 1)
-	nameWidth, stateWidth, idWidth, versionWidth := columnWidths(innerWidth)
-	line := truncate(tableLine(nameWidth, stateWidth, idWidth, versionWidth, "", "NAME", "STATE", "ID", "VERSION"), innerWidth)
+	nameWidth, stateWidth, tenantWidth, ageWidth, idWidth := columnWidths(innerWidth)
+	line := truncate(tableLine(nameWidth, stateWidth, tenantWidth, ageWidth, idWidth, "",
+		m.sortHeader("NAME", "metadata.name"),
+		m.sortHeader("STATE", "status.state"),
+		m.sortHeader("TENANT", "metadata.tenant"),
+		m.sortHeader("AGE", "metadata.creation_timestamp"),
+		"ID"), innerWidth)
 	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241")).Render(line)
 	lines := []string{header}
 	capacity := maxInt(height-3, 1)
@@ -802,24 +1684,36 @@ func (m Model) listView(width, height int) string {
 		row := m.rows[index]
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 		cursor := "  "
+		if m.selectedIDs[row.ID] {
+			cursor = "* "
+		}
 		if index == m.selected {
 			cursor = "> "
+			if m.selectedIDs[row.ID] {
+				cursor = ">*"
+			}
 			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
 		}
 		lines = append(lines, style.Render(truncate(tableLine(
 			nameWidth,
 			stateWidth,
+			tenantWidth,
+			ageWidth,
 			idWidth,
-			versionWidth,
 			cursor,
 			row.Name,
 			compactState(row.State),
+			row.Tenant,
+			entityAge(row.Created),
 			row.ID,
-			row.Version,
 		), innerWidth)))
 	}
 	if len(m.rows) == 0 && !m.loading {
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("No resources found"))
+		message := "No resources found"
+		if m.filter != "" {
+			message = "No resources match the filter"
+		}
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(message))
 	}
 	return panel(strings.Join(lines, "\n"), width, height, lipgloss.Color("99"))
 }
@@ -871,22 +1765,39 @@ func (m Model) detailView() string {
 }
 
 func (m Model) footerView() string {
+	pageSize := m.effectivePageSize()
 	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
 	if m.err != nil {
 		statusStyle = statusStyle.Foreground(lipgloss.Color("204"))
 	}
 	statusText := truncate(m.status, maxInt(m.width/2, 1))
 	status := statusStyle.Render(statusText)
-	keyText := "tab kinds  : command  enter view  r refresh  q quit"
+	keyText := fmt.Sprintf("tab kinds  / filter  space select  s sort  a auto-refresh  n/p page  enter view  q quit  page %d/%d",
+		m.page+1, maxInt((m.total+pageSize-1)/pageSize, 1))
 	if m.commandMode {
 		keyText = "up/down cycle  tab complete  enter select  esc cancel"
+	} else if m.filterMode {
+		keyText = "enter apply  esc cancel  | fuzzy search"
+	} else if m.screen == consoleScreen {
+		keyText = "type to send input  esc close console"
 	} else if m.resource.Writable() {
-		keyText = "tab kinds  c create  enter view  e edit  d delete  r refresh  q quit"
+		keyText = fmt.Sprintf("tab kinds  / filter  space select  d bulk delete  s sort  a auto-refresh  n/p page  c create  enter view  e edit  r refresh  q quit  page %d/%d",
+			m.page+1, maxInt((m.total+pageSize-1)/pageSize, 1))
 	}
 	keyWidth := maxInt(m.width-lipgloss.Width(statusText)-6, 1)
 	keys := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(truncate(keyText, keyWidth))
 	return lipgloss.NewStyle().Width(maxInt(m.width-2, 1)).Render(
 		lipgloss.JoinHorizontal(lipgloss.Left, status, "    ", keys))
+}
+
+func (m Model) sortHeader(label, field string) string {
+	if m.sortField != field {
+		return label
+	}
+	if m.sortDesc {
+		return label + " v"
+	}
+	return label + " ^"
 }
 
 func panel(content string, width, height int, border lipgloss.TerminalColor) string {
@@ -900,27 +1811,56 @@ func panel(content string, width, height int, border lipgloss.TerminalColor) str
 		Render(content)
 }
 
-func tableLine(nameWidth, stateWidth, idWidth, versionWidth int, cursor, name, state, id, version string) string {
+func tableLine(nameWidth, stateWidth, tenantWidth, ageWidth, idWidth int, cursor, name, state, tenant, age, id string) string {
 	return fmt.Sprintf(
-		"%-2s %-*s %-*s %-*s %-*s",
+		"%-2s %-*s %-*s %-*s %-*s %-*s",
 		cursor,
 		nameWidth,
 		truncate(name, nameWidth),
 		stateWidth,
 		truncate(state, stateWidth),
+		tenantWidth,
+		truncate(tenant, tenantWidth),
+		ageWidth,
+		truncate(age, ageWidth),
 		idWidth,
 		truncate(id, idWidth),
-		versionWidth,
-		truncate(version, versionWidth),
 	)
 }
 
-func columnWidths(width int) (int, int, int, int) {
-	nameWidth := maxInt(width/4, 10)
-	stateWidth := maxInt(width/6, 8)
-	idWidth := maxInt(width/3, 12)
-	versionWidth := maxInt(width-nameWidth-stateWidth-idWidth-4, 8)
-	return nameWidth, stateWidth, idWidth, versionWidth
+func columnWidths(width int) (int, int, int, int, int) {
+	nameWidth := maxInt(width/5, 10)
+	stateWidth := maxInt(width/7, 8)
+	tenantWidth := maxInt(width/7, 8)
+	ageWidth := 6
+	idWidth := maxInt(width-nameWidth-stateWidth-tenantWidth-ageWidth-5, 12)
+	return nameWidth, stateWidth, tenantWidth, ageWidth, idWidth
+}
+
+func entityAge(created time.Time) string {
+	if created.IsZero() {
+		return "-"
+	}
+	age := time.Since(created)
+	if age < 0 {
+		return "0s"
+	}
+	if age >= 365*24*time.Hour {
+		return fmt.Sprintf("%dy", int(age/(365*24*time.Hour)))
+	}
+	if age >= 30*24*time.Hour {
+		return fmt.Sprintf("%dmo", int(age/(30*24*time.Hour)))
+	}
+	if age >= 24*time.Hour {
+		return fmt.Sprintf("%dd", int(age/(24*time.Hour)))
+	}
+	if age >= time.Hour {
+		return fmt.Sprintf("%dh", int(age/time.Hour))
+	}
+	if age >= time.Minute {
+		return fmt.Sprintf("%dm", int(age/time.Minute))
+	}
+	return fmt.Sprintf("%ds", int(age/time.Second))
 }
 
 func compactState(state string) string {

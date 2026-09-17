@@ -65,8 +65,15 @@ on another host port.
 | --- | --- |
 | `tab` | Search and choose a resource kind; type to filter, arrows to cycle, `enter` to select |
 | `:` | Open resource command mode; type a prefix, `tab` to complete, arrows to cycle |
+| `?` | Show the command and key reference |
 | `j`/`k`, arrows | Move through rows or resource kinds |
+| `/` | Enter a CEL filter for the current resource |
+| `s` | Cycle sort field and direction |
+| `n`/`p` | Next or previous page |
+| `a` | Toggle 1-second auto-refresh (enabled by default) |
 | `enter` | Open the selected object |
+| `space` | Select or unselect the current row |
+| `l` | Show related resources and navigate to one |
 | `c` | Create an object with the system editor |
 | `e` | Edit the selected object with the system editor |
 | `d` | Delete the selected object |
@@ -74,9 +81,27 @@ on another host port.
 | `esc` | Go back or cancel |
 | `q` | Quit |
 
+The command palette also accepts `:help`, `:filter`, `:sort`, `:refresh`,
+`:next`, `:previous`, and `:quit`.
+
+Select multiple rows with `space`, then press `d` to bulk delete them.
+
 The system editor is selected from `VISUAL`, then `EDITOR`, and falls back to
 `vi`. Save and exit the editor to submit the complete protobuf object. Updates
 use the object's `metadata.version` for optimistic locking.
+
+Updates show a change review before submission; press `y` to submit or `n`/`esc`
+to discard. If the server rejects a save, the editor reopens with the submitted
+YAML and the error added as a comment. Common credential fields are redacted in
+read-only YAML views.
+
+On compute and bare-metal instance detail views, `c` opens the serial console.
+Press `esc` to close it. VNC console support is not currently included.
+
+Press `/` and enter a fuzzy search such as `te1`; matching characters may be
+separated and are matched against the name, ID, tenant, and state. Press `s`
+to cycle through name, state, tenant, and age ordering; `^` or `v` in the active
+header shows the direction. Results are loaded in pages of 50 objects.
 
 The header shows the connected address, authenticated user and organization,
 TUI version, and OSAC version. Set `OSAC_VERSION` or pass `--osac-version` when
