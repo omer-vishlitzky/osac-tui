@@ -1472,6 +1472,7 @@ func (m Model) helpView() string {
 		"  a                 toggle 1-second auto-refresh",
 		"  c / e / d         create / edit / delete",
 		"  c (detail)        open serial console for instances",
+		"  y (detail)        copy object YAML",
 		"",
 		"Commands",
 		"  :                 open command palette",
