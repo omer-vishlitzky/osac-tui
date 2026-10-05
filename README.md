@@ -24,7 +24,7 @@ Release binaries are published for Linux, macOS, and Windows. For Linux or
 macOS, choose the release version and your platform:
 
 ```sh
-VERSION=v0.1.0
+VERSION=v0.0.1
 OS=linux       # use darwin for macOS
 ARCH=amd64     # use arm64 on Apple Silicon or ARM Linux
 curl -fL "https://github.com/omer-vishlitzky/osac-tui/releases/download/${VERSION}/osac-tui_${VERSION}_${OS}_${ARCH}" -o osac-tui
