@@ -5,6 +5,8 @@ to feel like `k9s` for fulfillment resources: pick a resource kind, inspect
 objects as YAML, and use the same screen to create, update, refresh, or delete
 them.
 
+![OSAC TUI demo showing the project list and a project's YAML details](assets/osac-tui-demo.gif)
+
 When `--address` or `--token` is omitted, the TUI opens a login modal. Enter a
 kubeconfig path or leave the suggested path (or the field) as-is to use the
 current kubectl configuration. The login flow discovers the fulfillment API
