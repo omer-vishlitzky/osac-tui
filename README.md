@@ -5,6 +5,8 @@ to feel like `k9s` for fulfillment resources: pick a resource kind, inspect
 objects as YAML, and use the same screen to create, update, refresh, or delete
 them.
 
+![Animated OSAC TUI demo showing tenant selection and project create/edit flows](assets/osac-tui-demo.gif)
+
 When `--address` or `--token` is omitted, the TUI opens a login modal. Enter a
 kubeconfig path or leave the suggested path (or the field) as-is to use the
 current kubectl configuration. The login flow discovers the fulfillment API
@@ -22,7 +24,7 @@ Release binaries are published for Linux, macOS, and Windows. For Linux or
 macOS, choose the release version and your platform:
 
 ```sh
-VERSION=v0.1.0
+VERSION=v0.0.1
 OS=linux       # use darwin for macOS
 ARCH=amd64     # use arm64 on Apple Silicon or ARM Linux
 curl -fL "https://github.com/omer-vishlitzky/osac-tui/releases/download/${VERSION}/osac-tui_${VERSION}_${OS}_${ARCH}" -o osac-tui
