@@ -391,6 +391,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = message.err
 		if message.err != nil {
 			m.status = "Unavailable on this server"
+			m.errorDialog = true
 			return m, nil
 		}
 		m.err = nil
