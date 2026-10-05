@@ -127,6 +127,26 @@ func TestViewDoesNotRenderRawRPCError(t *testing.T) {
 	}
 }
 
+func TestListFailureShowsRPCErrorDialog(t *testing.T) {
+	rpcErr := errors.New("rpc error: code = Unauthenticated desc = token issuer is not trusted")
+	model := Model{
+		resource: testResource{key: "Projects"},
+		width:    100,
+		height:   30,
+		loading:  true,
+		screen:   listScreen,
+	}
+
+	updated, _ := model.Update(rowsLoadedMsg{err: rpcErr})
+	model = updated.(Model)
+	if !model.errorDialog {
+		t.Fatal("list failure did not open the error dialog")
+	}
+	if !strings.Contains(model.View(), rpcErr.Error()) {
+		t.Fatal("error dialog does not show the list RPC error")
+	}
+}
+
 func TestErrorDialogShowsRawRPCError(t *testing.T) {
 	model := Model{
 		resource:    testResource{key: "Projects"},

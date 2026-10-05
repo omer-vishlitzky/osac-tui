@@ -34,15 +34,31 @@ func main() {
 
 func run() error {
 	var options options
-	flag.StringVar(&options.address, "address", "localhost:8000", "fulfillment-service gRPC address")
+	flag.StringVar(&options.address, "address", os.Getenv("OSAC_ADDRESS"), "fulfillment-service gRPC address (discovered from Kubernetes when omitted)")
 	flag.BoolVar(&options.tls, "tls", false, "use TLS for the gRPC connection")
 	flag.BoolVar(&options.insecure, "insecure", false, "skip TLS certificate verification (unsafe)")
 	flag.StringVar(&options.caFile, "ca-file", "", "PEM file containing an additional CA certificate")
-	flag.StringVar(&options.token, "token", "", "bearer token for the gRPC connection")
+	flag.StringVar(&options.token, "token", os.Getenv("OSAC_TOKEN"), "bearer token for the gRPC connection (requested from Kubernetes when omitted)")
 	flag.StringVar(&options.osacVersion, "osac-version", os.Getenv("OSAC_VERSION"), "OSAC API version to display")
 	flag.Parse()
 
-	tlsConfig, err := loadTLSConfig(options)
+	var clusterCA []byte
+	if options.address == "" || options.token == "" {
+		login, err := ui.PromptLogin(options.address == "", options.token == "")
+		if err != nil {
+			return err
+		}
+		if options.address == "" {
+			options.address = login.Address
+			options.tls = true
+		}
+		if options.token == "" {
+			options.token = login.Token
+		}
+		clusterCA = login.CAPEM
+	}
+
+	tlsConfig, err := loadTLSConfig(options, clusterCA)
 	if err != nil {
 		return err
 	}
@@ -64,7 +80,7 @@ func run() error {
 	return err
 }
 
-func loadTLSConfig(options options) (*tls.Config, error) {
+func loadTLSConfig(options options, clusterCA []byte) (*tls.Config, error) {
 	if !options.tls && options.insecure {
 		return nil, errors.New("--insecure requires --tls")
 	}
@@ -79,20 +95,27 @@ func loadTLSConfig(options options) (*tls.Config, error) {
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: options.insecure,
 	}
-	if options.caFile == "" {
+	if options.caFile == "" && len(clusterCA) == 0 {
 		return config, nil
 	}
 
-	data, err := os.ReadFile(options.caFile)
-	if err != nil {
-		return nil, fmt.Errorf("read CA file %q: %w", options.caFile, err)
-	}
 	roots, err := x509.SystemCertPool()
-	if err != nil {
-		return nil, fmt.Errorf("load system CA pool: %w", err)
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
 	}
-	if ok := roots.AppendCertsFromPEM(data); !ok {
-		return nil, fmt.Errorf("CA file %q contains no certificates", options.caFile)
+	if options.caFile != "" {
+		data, err := os.ReadFile(options.caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA file %q: %w", options.caFile, err)
+		}
+		if ok := roots.AppendCertsFromPEM(data); !ok {
+			return nil, fmt.Errorf("CA file %q contains no certificates", options.caFile)
+		}
+	}
+	if len(clusterCA) > 0 {
+		if ok := roots.AppendCertsFromPEM(clusterCA); !ok {
+			return nil, errors.New("cluster CA contains no certificates")
+		}
 	}
 	config.RootCAs = roots
 	return config, nil

@@ -5,19 +5,37 @@ to feel like `k9s` for fulfillment resources: pick a resource kind, inspect
 objects as YAML, and use the same screen to create, update, refresh, or delete
 them.
 
-The fulfillment service must already be running at the address passed to
-`--address`. The TUI opens before the first RPC completes, so connection errors
-appear in the status line instead of blocking startup.
+When `--address` or `--token` is omitted, the TUI opens a login modal. Enter a
+kubeconfig path or leave the suggested path (or the field) as-is to use the
+current kubectl configuration. The login flow discovers the fulfillment API
+hostname from an Ingress, HTTPRoute, TLSRoute, or OpenShift Route in the
+`osac` namespace and creates a short-lived token for the `admin` ServiceAccount
+using `kubectl create token admin -n osac`. Set `OSAC_NAMESPACE` or
+`OSAC_SERVICE_ACCOUNT` to override the defaults. The selected kubeconfig must be
+allowed to create a token for that ServiceAccount. The discovered endpoint uses
+port `443` by default, or `8443` for `.osac.localhost` hosts; set
+`OSAC_GATEWAY_PORT` to override it.
+
+## Download and install
+
+Release binaries are published for Linux, macOS, and Windows. For Linux or
+macOS, choose the release version and your platform:
+
+```sh
+VERSION=v0.1.0
+OS=linux       # use darwin for macOS
+ARCH=amd64     # use arm64 on Apple Silicon or ARM Linux
+curl -fL "https://github.com/omer-vishlitzky/osac-tui/releases/download/${VERSION}/osac-tui_${VERSION}_${OS}_${ARCH}" -o osac-tui
+chmod +x osac-tui
+sudo install -m 0755 osac-tui /usr/local/bin/osac-tui
+```
+
+For Windows, download `osac-tui_${VERSION}_windows_amd64.exe` from the same
+GitHub Release and place it on your `PATH`.
 
 ## Run
 
-The local fulfillment-service gRPC endpoint is plaintext by default:
-
-```sh
-go run ./cmd/osac-tui --address localhost:8000
-```
-
-For a TLS endpoint and bearer token:
+To connect directly, provide the gRPC address and bearer token:
 
 ```sh
 go run ./cmd/osac-tui \
@@ -26,22 +44,28 @@ go run ./cmd/osac-tui \
   --token "$OSAC_TOKEN"
 ```
 
+With no arguments, the TUI starts the interactive Kubernetes login flow:
+
+```sh
+go run ./cmd/osac-tui
+```
+
 Use `--ca-file` when the service certificate is signed by a private CA.
 For development-only connections, `--insecure` skips TLS certificate verification.
 
 ### OpenShift cluster
 
 The launcher below discovers the `fulfillment-api` route and cluster CA from
-Kubernetes, then obtains a short-lived token from the existing `osac-admin`
-Keycloak client. It requires `kubectl`, `curl`, and `jq`.
+Kubernetes, then creates a short-lived token for the `admin` ServiceAccount in
+the OSAC namespace. It requires `kubectl` and Go.
 
 ```sh
 KUBECONFIG=/home/ovishlit/.kube/elkana.kubeconfig bash ./run-cluster.sh
 ```
 
-Set `OSAC_CLIENT_ID` to use another client present in the
-`keycloak-client-secrets` secret. The token is held in memory and the temporary
-CA file is removed when the TUI exits.
+Set `OSAC_SERVICE_ACCOUNT` to use another ServiceAccount. The token is held in
+memory and the temporary CA file is removed when the TUI exits. Set
+`OSAC_GATEWAY_PORT` if the route is exposed on a port other than `443`.
 
 ### Kind dev cluster
 
