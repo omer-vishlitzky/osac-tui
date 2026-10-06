@@ -36,6 +36,11 @@ type rowsLoadedMsg struct {
 	err   error
 }
 
+type tenantsLoadedMsg struct {
+	rows []client.Row
+	err  error
+}
+
 type autoRefreshMsg struct{}
 
 type consoleOpenedMsg struct {
@@ -106,10 +111,15 @@ type Model struct {
 	filter      string
 	sortField   string
 	sortDesc    bool
+	tenant      string
 
 	screen        screen
 	resourceMenu  bool
 	resourceIndex int
+	tenantPicker  bool
+	tenantLoading bool
+	tenantRows    []client.Row
+	tenantIndex   int
 	confirmDelete bool
 	bulkDelete    bool
 	loading       bool
@@ -188,6 +198,7 @@ func (m Model) loadRowsCmd() tea.Cmd {
 	options := client.ListOptions{
 		Offset: 0,
 		Limit:  0,
+		Tenant: m.tenant,
 	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -195,6 +206,29 @@ func (m Model) loadRowsCmd() tea.Cmd {
 		result, err := resource.List(ctx, options)
 		return rowsLoadedMsg{rows: result.Rows, total: result.Total, err: err}
 	}
+}
+
+func (m Model) loadTenantsCmd() tea.Cmd {
+	resource := m.api.Resource("tenants")
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		result, err := resource.List(ctx, client.ListOptions{})
+		return tenantsLoadedMsg{rows: result.Rows, err: err}
+	}
+}
+
+func (m Model) openTenantPicker() (Model, tea.Cmd) {
+	if m.api == nil || m.api.Resource("tenants") == nil {
+		m.status = "Tenant selection is unavailable"
+		return m, nil
+	}
+	m.tenantPicker = true
+	m.tenantLoading = true
+	m.tenantRows = nil
+	m.tenantIndex = 0
+	m.status = "Loading tenants..."
+	return m, m.loadTenantsCmd()
 }
 
 func (m Model) openSerialConsoleCmd() tea.Cmd {
@@ -323,7 +357,7 @@ func (m Model) editCmd(data []byte) (tea.Cmd, error) {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case autoRefreshMsg:
-		if !m.autoRefresh || m.loading || m.diffMode || m.filterMode || m.commandMode || m.screen == consoleScreen {
+		if !m.autoRefresh || m.loading || m.diffMode || m.filterMode || m.commandMode || m.tenantPicker || m.screen == consoleScreen {
 			if m.autoRefresh {
 				return m, m.autoRefreshCmd()
 			}
@@ -396,6 +430,22 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = nil
 		m.status = fmt.Sprintf("%d/%d %s", len(m.rows), m.total, m.resource.Title())
+		return m, nil
+	case tenantsLoadedMsg:
+		m.tenantLoading = false
+		if message.err != nil {
+			m.tenantPicker = false
+			m.err = message.err
+			m.errorDialog = true
+			m.status = "Unable to load tenants"
+			return m, nil
+		}
+		m.tenantRows = message.rows
+		sort.Slice(m.tenantRows, func(left, right int) bool {
+			return m.tenantRows[left].Name < m.tenantRows[right].Name
+		})
+		m.tenantIndex = tenantPickerIndex(m.tenantRows, m.tenant)
+		m.status = "Select tenant view"
 		return m, nil
 	case objectLoadedMsg:
 		m.loading = false
@@ -517,6 +567,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.tenantPicker {
+		return m.updateTenantPicker(message)
+	}
 	if m.helpMode {
 		return m.updateHelp(message)
 	}
@@ -585,6 +638,8 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.resourceSearch.SetSuggestions(resourceCompletionSuggestions(m.resources, ""))
 		m.resourceSearch.Focus()
 		m.resourceIndex = resourceIndex(m.resources, m.resource.Key())
+	case "t":
+		return m.openTenantPicker()
 	case "up", "k":
 		m.selected = clamp(m.selected-1, len(m.rows))
 	case "down", "j":
@@ -683,6 +738,73 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, command
 	}
 	return m, nil
+}
+
+func (m Model) updateTenantPicker(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch key.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.tenantPicker = false
+		m.status = fmt.Sprintf("%d/%d %s", len(m.rows), m.total, m.resource.Title())
+	case "up", "k":
+		if !m.tenantLoading {
+			m.tenantIndex = clamp(m.tenantIndex-1, len(m.tenantRows)+1)
+		}
+	case "down", "j":
+		if !m.tenantLoading {
+			m.tenantIndex = clamp(m.tenantIndex+1, len(m.tenantRows)+1)
+		}
+	case "enter":
+		if m.tenantLoading {
+			return m, nil
+		}
+		return m.selectTenantView(m.tenantIndex)
+	}
+	return m, nil
+}
+
+func (m Model) selectTenantView(index int) (Model, tea.Cmd) {
+	tenant := ""
+	if index > 0 && index <= len(m.tenantRows) {
+		tenant = m.tenantRows[index-1].Name
+	}
+	m.tenantPicker = false
+	if m.tenant == tenant {
+		m.status = "Tenant view unchanged"
+		return m, nil
+	}
+	m.tenant = tenant
+	m.screen = listScreen
+	m.page = 0
+	m.selected = 0
+	m.filter = ""
+	m.filterInput.Reset()
+	m.selectedIDs = make(map[string]bool)
+	m.err = nil
+	m.loading = true
+	if tenant == "" {
+		m.status = "Loading all tenants..."
+	} else {
+		m.status = "Loading tenant " + tenant + "..."
+	}
+	return m, m.loadRowsCmd()
+}
+
+func tenantPickerIndex(rows []client.Row, tenant string) int {
+	if tenant == "" {
+		return 0
+	}
+	for index, row := range rows {
+		if row.Name == tenant {
+			return index + 1
+		}
+	}
+	return 0
 }
 
 func (m Model) updateDetail(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -853,7 +975,7 @@ func (m Model) updateCommand(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			query := strings.TrimSpace(m.commandInput.Value())
-			if suggestion := m.commandInput.CurrentSuggestion(); suggestion != "" {
+			if suggestion := m.commandInput.CurrentSuggestion(); suggestion != "" && !isCommandQuery(query) {
 				query = suggestion
 			}
 			m.commandMode = false
@@ -882,6 +1004,9 @@ func (m Model) executeCommand(query string) (tea.Model, tea.Cmd, bool) {
 		m.filterInput.Focus()
 		m.status = "Filter"
 		return m, nil, true
+	case "tenant":
+		updated, command := m.openTenantPicker()
+		return updated, command, true
 	case "sort":
 		m.nextSort()
 		m.loading = true
@@ -913,6 +1038,15 @@ func (m Model) executeCommand(query string) (tea.Model, tea.Cmd, bool) {
 		return m, tea.Quit, true
 	default:
 		return m, nil, false
+	}
+}
+
+func isCommandQuery(query string) bool {
+	switch strings.ToLower(strings.TrimSpace(query)) {
+	case "help", "filter", "sort", "tenant", "refresh", "next", "previous", "quit":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1118,7 +1252,7 @@ func relatedResource(resources []client.Resource, name string) (client.Resource,
 }
 
 func commandSuggestions(resources []client.Resource, query string) []string {
-	commands := []string{"help", "filter", "sort", "refresh", "next", "previous", "quit"}
+	commands := []string{"help", "filter", "sort", "tenant", "refresh", "next", "previous", "quit"}
 	suggestions := resourceCompletionSuggestions(resources, query)
 	query = strings.ToLower(strings.TrimSpace(query))
 	for _, command := range commands {
@@ -1425,6 +1559,9 @@ func (m Model) View() string {
 	if m.errorDialog {
 		return m.errorView()
 	}
+	if m.tenantPicker {
+		return m.tenantPickerView()
+	}
 	if m.helpMode {
 		return m.helpView()
 	}
@@ -1479,6 +1616,7 @@ func (m Model) helpView() string {
 		"  d                 delete selected rows",
 		"  l                 show related resources",
 		"  tab               choose resource kind",
+		"  t                 choose tenant view (:tenant also works)",
 		"  n / p             next / previous page",
 		"",
 		"List actions",
@@ -1494,6 +1632,7 @@ func (m Model) helpView() string {
 		"  :                 open command palette",
 		"  :filter           edit fuzzy filter",
 		"  :sort             change sort",
+		"  :tenant           switch tenant view",
 		"  :refresh          reload resources",
 		"",
 		"? / esc             close help",
@@ -1525,6 +1664,42 @@ func (m Model) relationshipView() string {
 	lines = append(lines, "", "up/down select  enter open  esc close")
 	dialog := lipgloss.NewStyle().
 		Width(minInt(maxInt(m.width-4, 1), 100)).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(1, 2).
+		Render(strings.Join(lines, "\n"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, dialog)
+}
+
+func (m Model) tenantPickerView() string {
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render("TENANT VIEW"),
+		"",
+	}
+	if m.tenantLoading {
+		lines = append(lines, "Loading tenants...")
+	} else {
+		optionCount := len(m.tenantRows) + 1
+		capacity := maxInt(minInt(10, m.height-10), 1)
+		start, end := visibleRows(m.tenantIndex, optionCount, capacity)
+		for option := start; option < end; option++ {
+			label := "All tenants"
+			if option > 0 {
+				label = m.tenantRows[option-1].Name
+			}
+			cursor := "  "
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+			if option == m.tenantIndex {
+				cursor = "> "
+				style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
+			}
+			lines = append(lines, style.Render(cursor+truncate(label, 56)))
+		}
+	}
+	lines = append(lines, "", "up/down select  enter switch  esc cancel")
+	width := minInt(maxInt(m.width-4, 1), 64)
+	dialog := lipgloss.NewStyle().
+		Width(width).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("205")).
 		Padding(1, 2).
@@ -1630,6 +1805,9 @@ func (m Model) headerView() string {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render(
 		truncate(fmt.Sprintf("OSAC TUI %s  /  %s", m.tuiVersion, m.resource.Title()), maxInt(m.width-6, 1)))
 	context := fmt.Sprintf("%s  |  %s  |  OSAC %s", m.connection.Address, user, osacVersion)
+	if m.tenant != "" {
+		context += "  |  tenant " + m.tenant
+	}
 	lines := []string{title, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(
 		truncate(context, maxInt(m.width-6, 1)))}
 	width := maxInt(m.width-2, 1)
@@ -1789,7 +1967,7 @@ func (m Model) footerView() string {
 	}
 	statusText := truncate(m.status, maxInt(m.width/2, 1))
 	status := statusStyle.Render(statusText)
-	keyText := fmt.Sprintf("tab kinds  / filter  space select  s sort  a auto-refresh  n/p page  enter view  q quit  page %d/%d",
+	keyText := fmt.Sprintf("tab kinds  t tenant  / filter  space select  s sort  a auto-refresh  n/p page  enter view  q quit  page %d/%d",
 		m.page+1, maxInt((m.total+pageSize-1)/pageSize, 1))
 	if m.commandMode {
 		keyText = "up/down cycle  tab complete  enter select  esc cancel"
@@ -1798,7 +1976,7 @@ func (m Model) footerView() string {
 	} else if m.screen == consoleScreen {
 		keyText = "type to send input  esc close console"
 	} else if m.resource.Writable() {
-		keyText = fmt.Sprintf("tab kinds  / filter  space select  d bulk delete  s sort  a auto-refresh  n/p page  c create  enter view  e edit  r refresh  q quit  page %d/%d",
+		keyText = fmt.Sprintf("tab kinds  t tenant  / filter  space select  d bulk delete  s sort  a auto-refresh  n/p page  c create  enter view  e edit  r refresh  q quit  page %d/%d",
 			m.page+1, maxInt((m.total+pageSize-1)/pageSize, 1))
 	}
 	keyWidth := maxInt(m.width-lipgloss.Width(statusText)-6, 1)

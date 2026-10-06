@@ -92,9 +92,10 @@ func newResource(conn *grpc.ClientConn, service protoreflect.ServiceDescriptor) 
 	}
 	objectDescriptor := objectField.Message()
 	writable := createMethod != nil && updateMethod != nil && deleteMethod != nil
+	resourceKey := strings.ToLower(string(service.Name()))
 
 	return resource{
-		key:      strings.ToLower(string(service.Name())),
+		key:      resourceKey,
 		title:    resourceTitle(string(service.Name())),
 		writable: writable,
 		list: func(ctx context.Context, options ListOptions) (ListResult, error) {
@@ -105,7 +106,7 @@ func newResource(conn *grpc.ClientConn, service protoreflect.ServiceDescriptor) 
 			if err := setIntField(request, "limit", int64(options.Limit)); err != nil {
 				return ListResult{}, err
 			}
-			if err := setStringFieldIfPresent(request, "filter", options.Filter); err != nil {
+			if err := setStringFieldIfPresent(request, "filter", listFilter(resourceKey, options)); err != nil {
 				return ListResult{}, err
 			}
 			if err := setStringFieldIfPresent(request, "order", options.Order); err != nil {
@@ -186,6 +187,23 @@ func newResource(conn *grpc.ClientConn, service protoreflect.ServiceDescriptor) 
 		new: func() proto.Message { return dynamicpb.NewMessage(objectDescriptor) },
 		row: reflectedRow,
 	}
+}
+
+func listFilter(resourceKey string, options ListOptions) string {
+	filter := options.Filter
+	if options.Tenant == "" {
+		return filter
+	}
+
+	field := "this.metadata.tenant"
+	if resourceKey == "tenants" {
+		field = "this.metadata.name"
+	}
+	tenantFilter := field + " == " + strconv.Quote(options.Tenant)
+	if filter == "" {
+		return tenantFilter
+	}
+	return "(" + tenantFilter + ") && (" + filter + ")"
 }
 
 func invokeResourceMethod(ctx context.Context, conn *grpc.ClientConn, method protoreflect.MethodDescriptor, request proto.Message) (proto.Message, error) {

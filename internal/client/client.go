@@ -46,6 +46,7 @@ type ListOptions struct {
 	Limit  int
 	Filter string
 	Order  string
+	Tenant string
 }
 
 type ListResult struct {

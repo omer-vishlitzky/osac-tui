@@ -74,3 +74,44 @@ func TestResourcesIncludesAllPublicEntities(t *testing.T) {
 		t.Fatalf("resource order is not sorted: %v", keys)
 	}
 }
+
+func TestListFilterScopesTenant(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		options ListOptions
+		want    string
+	}{
+		{
+			name:    "resource tenant",
+			key:     "projects",
+			options: ListOptions{Tenant: "team-a"},
+			want:    `this.metadata.tenant == "team-a"`,
+		},
+		{
+			name:    "tenant resource",
+			key:     "tenants",
+			options: ListOptions{Tenant: "team-a"},
+			want:    `this.metadata.name == "team-a"`,
+		},
+		{
+			name:    "combines filters",
+			key:     "projects",
+			options: ListOptions{Tenant: "team-a", Filter: `this.metadata.name.startsWith("prod")`},
+			want:    `(this.metadata.tenant == "team-a") && (this.metadata.name.startsWith("prod"))`,
+		},
+		{
+			name:    "escapes tenant literal",
+			key:     "projects",
+			options: ListOptions{Tenant: `team" || true || "x`},
+			want:    `this.metadata.tenant == "team\" || true || \"x"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := listFilter(test.key, test.options); got != test.want {
+				t.Errorf("listFilter() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
