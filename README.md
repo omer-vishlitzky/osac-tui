@@ -90,6 +90,7 @@ on another host port.
 | Key | Action |
 | --- | --- |
 | `tab` | Search and choose a resource kind; type to filter, arrows to cycle, `enter` to select |
+| `t` | Choose a tenant view; select “All tenants” to clear the scope |
 | `:` | Open resource command mode; type a prefix, `tab` to complete, arrows to cycle |
 | `?` | Show the command and key reference |
 | `j`/`k`, arrows | Move through rows or resource kinds |
@@ -108,8 +109,14 @@ on another host port.
 | `esc` | Go back or cancel |
 | `q` | Quit |
 
-The command palette also accepts `:help`, `:filter`, `:sort`, `:refresh`,
-`:next`, `:previous`, and `:quit`.
+The command palette also accepts `:help`, `:filter`, `:sort`, `:tenant`,
+`:refresh`, `:next`, `:previous`, and `:quit`.
+
+Tenant view is a listing scope for the current API session, not a change of
+identity. The selector lists tenants visible to the current user and applies a
+server-side CEL filter (`this.metadata.tenant` for resources and
+`this.metadata.name` for the tenant list). API permissions still determine which
+tenants and objects are available.
 
 Select multiple rows with `space`, then press `d` to bulk delete them.
 

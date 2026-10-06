@@ -99,6 +99,33 @@ func TestViewFitsTerminalWithResourceMenu(t *testing.T) {
 	}
 }
 
+func TestTenantPickerViewFitsTerminal(t *testing.T) {
+	rows := make([]client.Row, 30)
+	for index := range rows {
+		rows[index].Name = "tenant"
+	}
+	for _, size := range []struct {
+		width  int
+		height int
+	}{{40, 12}, {80, 24}, {100, 30}} {
+		model := Model{
+			tenantPicker: true,
+			tenantRows:   rows,
+			tenantIndex:  17,
+			width:        size.width,
+			height:       size.height,
+		}
+
+		view := model.View()
+		if got := lipgloss.Height(view); got != model.height {
+			t.Errorf("width %d height %d: view height = %d, want %d", model.width, model.height, got, model.height)
+		}
+		if got := lipgloss.Width(view); got > model.width {
+			t.Errorf("width %d height %d: view width = %d, want at most %d", model.width, model.height, got, model.width)
+		}
+	}
+}
+
 func TestTruncatePreservesValidUTF8(t *testing.T) {
 	if got := truncate("東京", 1); got != "東" {
 		t.Fatalf("truncate = %q, want %q", got, "東")
@@ -208,6 +235,31 @@ func TestSortAndPaginationControls(t *testing.T) {
 	}
 }
 
+func TestSelectingTenantResetsListState(t *testing.T) {
+	model := Model{
+		resource:     testResource{key: "projects"},
+		tenantRows:   []client.Row{{Name: "team-a"}},
+		tenantPicker: true,
+		page:         2,
+		selected:     4,
+		filter:       "old query",
+		filterInput:  textinput.New(),
+		selectedIDs:  map[string]bool{"project-1": true},
+	}
+
+	updated, command := model.selectTenantView(1)
+	if command == nil {
+		t.Fatal("tenant switch did not schedule a resource reload")
+	}
+	if updated.tenant != "team-a" {
+		t.Errorf("tenant scope = %q, want team-a", updated.tenant)
+	}
+	if updated.page != 0 || updated.selected != 0 || updated.filter != "" || len(updated.selectedIDs) != 0 {
+		t.Errorf("tenant switch did not reset list state: page=%d selected=%d filter=%q selectedIDs=%v",
+			updated.page, updated.selected, updated.filter, updated.selectedIDs)
+	}
+}
+
 func TestFuzzyMatch(t *testing.T) {
 	if !fuzzyMatch("tenant1", "te1") {
 		t.Fatal("expected fuzzy match")
@@ -274,6 +326,29 @@ func TestCommandCompletionCyclesAndSelectsSuggestion(t *testing.T) {
 	model = updated.(Model)
 	if got := model.resource.Key(); got != "projects" {
 		t.Fatalf("selected resource = %q, want projects", got)
+	}
+}
+
+func TestTenantCommandIsNotReplacedByTenantsResourceSuggestion(t *testing.T) {
+	input := textinput.New()
+	input.Prompt = ":"
+	input.ShowSuggestions = true
+	input.SetValue("tenant")
+	input.SetSuggestions([]string{"tenants", "tenant"})
+	model := Model{
+		resources:    []client.Resource{testResource{key: "tenants"}},
+		resource:     testResource{key: "projects"},
+		commandInput: input,
+		commandMode:  true,
+	}
+
+	updated, _ := model.updateCommand(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.resource.Key() != "projects" {
+		t.Fatalf("resource changed to %q instead of opening tenant picker", model.resource.Key())
+	}
+	if model.status != "Tenant selection is unavailable" {
+		t.Fatalf("status = %q, want tenant picker command", model.status)
 	}
 }
 
