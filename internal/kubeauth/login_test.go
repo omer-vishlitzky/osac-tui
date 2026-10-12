@@ -95,7 +95,7 @@ func TestSelectEndpointPrefersFulfillmentAPI(t *testing.T) {
 	got, err := selectEndpoint([]endpoint{
 		{name: "osac-ui", host: "console.osac.example.com"},
 		{name: "fulfillment-api", host: "fulfillment-api.osac.example.com"},
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,29 +104,70 @@ func TestSelectEndpointPrefersFulfillmentAPI(t *testing.T) {
 	}
 }
 
+func TestSelectEndpointUsesPrivateAPIEndpointAndLocalGatewayHost(t *testing.T) {
+	got, err := selectEndpoint([]endpoint{
+		{name: "fulfillment-api", host: "fulfillment-api.osac.localhost"},
+		{name: "fulfillment-internal-api", host: "fulfillment-internal-api.osac.svc.cluster.local"},
+		{name: "fulfillment-internal-api", host: "fulfillment-internal-api.osac.localhost"},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "fulfillment-internal-api.osac.localhost" {
+		t.Fatalf("selected host = %q, want private local gateway host", got)
+	}
+}
+
+func TestSelectEndpointUsesPublicAPIWhenPrivateEndpointIsAvailable(t *testing.T) {
+	got, err := selectEndpoint([]endpoint{
+		{name: "fulfillment-api", host: "fulfillment-api.osac.localhost"},
+		{name: "fulfillment-internal-api", host: "fulfillment-internal-api.osac.localhost"},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "fulfillment-api.osac.localhost" {
+		t.Fatalf("selected host = %q, want public API host", got)
+	}
+}
+
 func TestSelectEndpointRejectsAmbiguousOSACHosts(t *testing.T) {
 	_, err := selectEndpoint([]endpoint{
 		{name: "osac-ui-a", host: "ui-a.osac.example.com"},
 		{name: "osac-ui-b", host: "ui-b.osac.example.com"},
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("expected ambiguous host error")
 	}
 }
 
 func TestSelectEndpointNeverUsesOSACUIHost(t *testing.T) {
-	_, err := selectEndpoint([]endpoint{{name: "osac-ui", host: "console.osac.example.com"}})
+	_, err := selectEndpoint([]endpoint{{name: "osac-ui", host: "console.osac.example.com"}}, false)
 	if err == nil {
 		t.Fatal("selected the OSAC UI host as the fulfillment API")
 	}
 }
 
 func TestSelectEndpointUsesSingleUnlabeledHost(t *testing.T) {
-	got, err := selectEndpoint([]endpoint{{name: "gateway", host: "api.example.com"}})
+	got, err := selectEndpoint([]endpoint{{name: "gateway", host: "api.example.com"}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != "api.example.com" {
 		t.Fatalf("selected host = %q", got)
+	}
+}
+
+func TestSelectPrivateEndpointDoesNotFallBackToPublic(t *testing.T) {
+	_, err := selectEndpoint([]endpoint{{name: "fulfillment-api", host: "fulfillment-api.osac.example.com"}}, true)
+	if err == nil {
+		t.Fatal("private endpoint selection unexpectedly chose the public API")
+	}
+}
+
+func TestSelectPublicEndpointDoesNotFallBackToPrivate(t *testing.T) {
+	_, err := selectEndpoint([]endpoint{{name: "fulfillment-internal-api", host: "fulfillment-internal-api.osac.svc.cluster.local"}}, false)
+	if err == nil {
+		t.Fatal("public endpoint selection unexpectedly chose the private API")
 	}
 }

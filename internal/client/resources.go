@@ -9,11 +9,12 @@ import (
 	"time"
 	"unicode"
 
+	_ "github.com/osac-project/osac/proto/gen/cleanapi"
+	_ "github.com/osac-project/osac/proto/gen/osac/private/v1"
 	_ "github.com/osac-project/osac/proto/gen/osac/public/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
@@ -59,25 +60,6 @@ func (r resource) Delete(ctx context.Context, id string) error { return r.delete
 func (r resource) New() proto.Message { return r.new() }
 
 func (r resource) Row(object proto.Message) Row { return r.row(object) }
-
-func resources(conn *grpc.ClientConn) map[string]Resource {
-	result := make(map[string]Resource)
-	protoregistry.GlobalFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
-		if string(file.Package()) != "osac.public.v1" {
-			return true
-		}
-		for index := 0; index < file.Services().Len(); index++ {
-			service := file.Services().Get(index)
-			if service.Methods().ByName("List") == nil || service.Methods().ByName("Get") == nil {
-				continue
-			}
-			resource := newResource(conn, service)
-			result[resource.Key()] = resource
-		}
-		return true
-	})
-	return result
-}
 
 func newResource(conn *grpc.ClientConn, service protoreflect.ServiceDescriptor) Resource {
 	listMethod := service.Methods().ByName("List")

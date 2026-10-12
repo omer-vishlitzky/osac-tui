@@ -53,7 +53,7 @@ type kubectlRunner func(context.Context, string, ...string) ([]byte, error)
 
 // Login discovers the OSAC API endpoint and, when requested, creates a token
 // for the admin ServiceAccount using the selected kubeconfig.
-func Login(ctx context.Context, kubeconfig string, needAddress, needToken bool) (Result, error) {
+func Login(ctx context.Context, kubeconfig string, needAddress, needToken, privateAPI bool) (Result, error) {
 	namespace := envOr("OSAC_NAMESPACE", defaultNamespace)
 	serviceAccount := envOr("OSAC_SERVICE_ACCOUNT", defaultServiceAccount)
 
@@ -63,7 +63,7 @@ func Login(ctx context.Context, kubeconfig string, needAddress, needToken bool) 
 		if err != nil {
 			return Result{}, fmt.Errorf("discover OSAC endpoint: %w", err)
 		}
-		apiHost, err := selectEndpoint(apiEndpoints)
+		apiHost, err := selectEndpoint(apiEndpoints, privateAPI)
 		if err != nil {
 			return Result{}, fmt.Errorf("find the OSAC API address in namespace %q: %w", namespace, err)
 		}
@@ -165,7 +165,7 @@ func parseResourceEndpoints(data []byte) ([]endpoint, error) {
 	return endpoints, nil
 }
 
-func selectEndpoint(endpoints []endpoint) (string, error) {
+func selectEndpoint(endpoints []endpoint, privateAPI bool) (string, error) {
 	if len(endpoints) == 0 {
 		return "", errors.New("no hostname found")
 	}
@@ -179,6 +179,19 @@ func selectEndpoint(endpoints []endpoint) (string, error) {
 		name := strings.ToLower(candidate.name)
 		host := strings.ToLower(candidate.host)
 		if strings.Contains(name, "osac-ui") || strings.Contains(host, "osac-ui") {
+			continue
+		}
+		if privateAPI {
+			if strings.Contains(name, "fulfillment-internal-api") || strings.Contains(host, "fulfillment-internal-api") {
+				rank = 120
+				if strings.HasSuffix(host, ".localhost") {
+					rank++
+				}
+				ranked = append(ranked, rankedEndpoint{endpoint: candidate, rank: rank})
+			}
+			continue
+		}
+		if strings.Contains(name, "fulfillment-internal-api") || strings.Contains(host, "fulfillment-internal-api") {
 			continue
 		}
 		switch {
@@ -200,11 +213,18 @@ func selectEndpoint(endpoints []endpoint) (string, error) {
 		}
 	}
 	if len(ranked) == 0 {
+		if privateAPI {
+			return "", errors.New("no fulfillment-internal-api hostname found")
+		}
 		var remaining []endpoint
 		for _, candidate := range endpoints {
-			if !strings.Contains(strings.ToLower(candidate.name), "osac-ui") && !strings.Contains(strings.ToLower(candidate.host), "osac-ui") {
-				remaining = append(remaining, candidate)
+			name := strings.ToLower(candidate.name)
+			host := strings.ToLower(candidate.host)
+			if strings.Contains(name, "osac-ui") || strings.Contains(host, "osac-ui") ||
+				strings.Contains(name, "fulfillment-internal-api") || strings.Contains(host, "fulfillment-internal-api") {
+				continue
 			}
+			remaining = append(remaining, candidate)
 		}
 		if len(remaining) == 1 {
 			return remaining[0].host, nil

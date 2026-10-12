@@ -42,6 +42,7 @@ To connect directly, provide the gRPC address and bearer token:
 ```sh
 go run ./cmd/osac-tui \
   --address fulfillment-api.example.com:443 \
+  --private-api=false \
   --tls \
   --token "$OSAC_TOKEN"
 ```
@@ -51,6 +52,12 @@ With no arguments, the TUI starts the interactive Kubernetes login flow:
 ```sh
 go run ./cmd/osac-tui
 ```
+
+The private API is selected by default, including automatic discovery of the
+`fulfillment-internal-api` endpoint when the address is discovered from
+Kubernetes. Pass `--private-api=false` to select the public API and its
+`fulfillment-api` endpoint instead. When `--address` is supplied explicitly,
+it is used as-is; make sure it matches the selected API.
 
 Use `--ca-file` when the service certificate is signed by a private CA.
 For development-only connections, `--insecure` skips TLS certificate verification.
@@ -144,8 +151,11 @@ directly.
 
 ## Scope
 
-The client discovers every listable entity service in the public API. Full CRUD
-services support create, update, and delete; read-only services such as catalog
-and storage resources support listing and inspection only. Non-resource APIs
-such as events and console streaming are not shown as resource kinds.
+The client uses gRPC server reflection to discover services and their schemas,
+then checks each candidate `List` RPC. The resource list therefore matches the
+listable entities available through the selected API. Server reflection must be
+enabled. Full CRUD services support create, update, and delete; read-only
+services such as catalogs and volumes support listing and inspection only.
+Non-resource APIs such as events and console streaming are not shown as
+resource kinds.
 # osac-tui

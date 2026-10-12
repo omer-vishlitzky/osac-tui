@@ -18,6 +18,7 @@ import (
 
 type options struct {
 	address     string
+	privateAPI  bool
 	tls         bool
 	insecure    bool
 	caFile      string
@@ -35,6 +36,7 @@ func main() {
 func run() error {
 	var options options
 	flag.StringVar(&options.address, "address", os.Getenv("OSAC_ADDRESS"), "fulfillment-service gRPC address (discovered from Kubernetes when omitted)")
+	flag.BoolVar(&options.privateAPI, "private-api", true, "use private API resources (set false to use public API resources)")
 	flag.BoolVar(&options.tls, "tls", false, "use TLS for the gRPC connection")
 	flag.BoolVar(&options.insecure, "insecure", false, "skip TLS certificate verification (unsafe)")
 	flag.StringVar(&options.caFile, "ca-file", "", "PEM file containing an additional CA certificate")
@@ -44,7 +46,7 @@ func run() error {
 
 	var clusterCA []byte
 	if options.address == "" || options.token == "" {
-		login, err := ui.PromptLogin(options.address == "", options.token == "")
+		login, err := ui.PromptLogin(options.address == "", options.token == "", options.privateAPI)
 		if err != nil {
 			return err
 		}
@@ -67,9 +69,10 @@ func run() error {
 	defer cancel()
 
 	api, err := client.Dial(ctx, client.Config{
-		Address:   options.address,
-		TLSConfig: tlsConfig,
-		Token:     options.token,
+		Address:    options.address,
+		PrivateAPI: options.privateAPI,
+		TLSConfig:  tlsConfig,
+		Token:      options.token,
 	})
 	if err != nil {
 		return err

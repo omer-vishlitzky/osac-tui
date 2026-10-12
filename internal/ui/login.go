@@ -21,6 +21,7 @@ type loginModel struct {
 	input       textinput.Model
 	needAddress bool
 	needToken   bool
+	privateAPI  bool
 	busy        bool
 	width       int
 	height      int
@@ -30,7 +31,7 @@ type loginModel struct {
 
 // PromptLogin opens the startup login modal and returns the cluster details it
 // discovers using the kubeconfig entered by the user.
-func PromptLogin(needAddress, needToken bool) (kubeauth.Result, error) {
+func PromptLogin(needAddress, needToken, privateAPI bool) (kubeauth.Result, error) {
 	input := textinput.New()
 	input.Prompt = "Kubeconfig: "
 	input.Placeholder = "blank uses current kubectl context"
@@ -38,7 +39,7 @@ func PromptLogin(needAddress, needToken bool) (kubeauth.Result, error) {
 	input.CharLimit = 1024
 	input.Focus()
 
-	model := loginModel{input: input, needAddress: needAddress, needToken: needToken}
+	model := loginModel{input: input, needAddress: needAddress, needToken: needToken, privateAPI: privateAPI}
 	final, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
 	if err != nil {
 		return kubeauth.Result{}, err
@@ -56,10 +57,11 @@ func (m loginModel) loginCmd() tea.Cmd {
 	kubeconfig := strings.TrimSpace(m.input.Value())
 	needAddress := m.needAddress
 	needToken := m.needToken
+	privateAPI := m.privateAPI
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		result, err := kubeauth.Login(ctx, kubeconfig, needAddress, needToken)
+		result, err := kubeauth.Login(ctx, kubeconfig, needAddress, needToken, privateAPI)
 		return loginFinishedMsg{result: result, err: err}
 	}
 }
@@ -117,7 +119,11 @@ func (m loginModel) View() string {
 		"Choose a kubeconfig for OSAC authentication.",
 	}
 	if m.needAddress {
-		body = append(body, "The API address will be discovered from the cluster.")
+		apiName := "public"
+		if m.privateAPI {
+			apiName = "private"
+		}
+		body = append(body, "The "+apiName+" API address will be discovered from the cluster.")
 	}
 	if m.needToken {
 		body = append(body, "A token will be created for the admin ServiceAccount in the OSAC namespace.")
@@ -126,11 +132,15 @@ func (m loginModel) View() string {
 		"enter connect  |  blank uses current kubectl context  |  esc quit"))
 	if m.busy {
 		status := "Preparing OSAC connection..."
+		apiName := "public"
+		if m.privateAPI {
+			apiName = "private"
+		}
 		switch {
 		case m.needAddress && m.needToken:
-			status = "Discovering API and creating admin token..."
+			status = "Discovering " + apiName + " API and creating admin token..."
 		case m.needAddress:
-			status = "Discovering OSAC API address..."
+			status = "Discovering OSAC " + apiName + " API address..."
 		case m.needToken:
 			status = "Creating admin ServiceAccount token..."
 		}
