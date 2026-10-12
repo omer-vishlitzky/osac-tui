@@ -197,6 +197,40 @@ func TestErrorDialogShowsRawRPCError(t *testing.T) {
 	}
 }
 
+func TestErrorDialogIgnoresAsyncMessagesUntilDismissed(t *testing.T) {
+	rpcErr := errors.New("request failed")
+	model := Model{
+		resource:    testResource{key: "Projects"},
+		width:       100,
+		height:      30,
+		err:         rpcErr,
+		errorDialog: true,
+	}
+
+	updated, _ := model.Update(rowsLoadedMsg{})
+	model = updated.(Model)
+	if !model.errorDialog {
+		t.Fatal("asynchronous message dismissed the error dialog")
+	}
+	if !errors.Is(model.err, rpcErr) {
+		t.Fatalf("dialog error = %v, want %v", model.err, rpcErr)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.errorDialog || model.err != nil {
+		t.Fatal("enter did not dismiss and clear the error dialog")
+	}
+}
+
+func TestErrorDialogWithoutErrorDoesNotPanic(t *testing.T) {
+	model := Model{width: 100, height: 30, errorDialog: true, screen: listScreen}
+	view := model.View()
+	if !strings.Contains(view, "without an error message") {
+		t.Fatal("error dialog does not show its fallback message")
+	}
+}
+
 func TestResourceSearchMatchesKeysTitlesAndSubstrings(t *testing.T) {
 	resources := []client.Resource{
 		testResource{key: "projectmemberships", title: "Project Memberships"},
