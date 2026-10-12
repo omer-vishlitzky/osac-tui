@@ -20,9 +20,10 @@ import (
 )
 
 type Config struct {
-	Address   string
-	TLSConfig *tls.Config
-	Token     string
+	Address    string
+	PrivateAPI bool
+	TLSConfig  *tls.Config
+	Token      string
 }
 
 type ConnectionInfo struct {
@@ -86,7 +87,10 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 		grpc.WithTransportCredentials(transport),
 	}
 	if config.Token != "" {
-		options = append(options, grpc.WithUnaryInterceptor(bearerInterceptor(config.Token)))
+		options = append(options,
+			grpc.WithUnaryInterceptor(bearerInterceptor(config.Token)),
+			grpc.WithStreamInterceptor(bearerStreamInterceptor(config.Token)),
+		)
 	}
 
 	conn, err := grpc.DialContext(ctx, config.Address, options...)
@@ -94,7 +98,11 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 		return nil, fmt.Errorf("connect to fulfillment-service at %q: %w", config.Address, err)
 	}
 
-	resources := resources(conn)
+	resources, err := discoverResources(ctx, conn, config.PrivateAPI)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("discover resources from %q: %w", config.Address, err)
+	}
 	return &Client{
 		conn:      conn,
 		resources: resources,
@@ -244,6 +252,13 @@ func bearerInterceptor(token string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, request, reply interface{}, conn *grpc.ClientConn, invoker grpc.UnaryInvoker, options ...grpc.CallOption) error {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 		return invoker(ctx, method, request, reply, conn, options...)
+	}
+}
+
+func bearerStreamInterceptor(token string) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, description *grpc.StreamDesc, conn *grpc.ClientConn, method string, streamer grpc.Streamer, options ...grpc.CallOption) (grpc.ClientStream, error) {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+		return streamer(ctx, description, conn, method, options...)
 	}
 }
 
