@@ -355,6 +355,11 @@ func (m Model) editCmd(data []byte) (tea.Cmd, error) {
 }
 
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	if m.errorDialog {
+		if _, isWindowSize := message.(tea.WindowSizeMsg); !isWindowSize {
+			return m.updateErrorDialog(message)
+		}
+	}
 	switch message := message.(type) {
 	case autoRefreshMsg:
 		if !m.autoRefresh || m.loading || m.diffMode || m.filterMode || m.commandMode || m.tenantPicker || m.screen == consoleScreen {
@@ -553,20 +558,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = actionProgress[m.action]
 		return m, m.mutationCmd(object)
 	}
-	if m.errorDialog {
-		key, ok := message.(tea.KeyMsg)
-		if !ok {
-			return m, nil
-		}
-		switch key.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		case "enter", "esc":
-			m.errorDialog = false
-			m.err = nil
-		}
-		return m, nil
-	}
 	if m.tenantPicker {
 		return m.updateTenantPicker(message)
 	}
@@ -619,6 +610,21 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDetail(message)
 	}
 	return m.updateList(message)
+}
+
+func (m Model) updateErrorDialog(message tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := message.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch key.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "enter", "esc":
+		m.errorDialog = false
+		m.err = nil
+	}
+	return m, nil
 }
 
 func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -1587,7 +1593,11 @@ func (m Model) View() string {
 
 func (m Model) errorView() string {
 	width := minInt(maxInt(m.width-4, 1), 100)
-	message := wrapText(m.err.Error(), width-4)
+	messageText := "The request failed without an error message."
+	if m.err != nil {
+		messageText = m.err.Error()
+	}
+	message := wrapText(messageText, width-4)
 	body := lipgloss.JoinVertical(
 		lipgloss.Left,
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("204")).Render("REQUEST FAILED"),
